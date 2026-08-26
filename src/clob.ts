@@ -11,6 +11,7 @@ import { Logger } from "./logger.js";
 
 export interface ClobConfig {
   host: string;
+  rpcUrl?: string;
   chainId: number;
   privateKey: string;
   signatureType: number;
@@ -44,7 +45,7 @@ export class ClobService {
 
     const walletClient = createWalletClient({
       account,
-      transport: http(config.host),
+      transport: http(config.rpcUrl),
     });
 
     const chain =
@@ -75,6 +76,8 @@ export class ClobService {
       chain,
       signer: walletClient,
       creds,
+      signatureType: config.signatureType,
+      funderAddress: config.funderAddress,
     });
 
     return new ClobService(client, logger);

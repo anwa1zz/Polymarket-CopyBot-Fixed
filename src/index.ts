@@ -49,6 +49,7 @@ const main = async () => {
       privateKey: config.privateKey,
       signatureType: config.signatureType,
       funderAddress: config.funderAddress,
+      rpcUrl: config.rpcUrl,
       apiCreds: config.apiCreds,
     },
     logger,
