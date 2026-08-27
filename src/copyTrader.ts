@@ -4,8 +4,32 @@ import { ClobService } from "./clob.js";
 import { DataApiClient } from "./dataApi.js";
 import { Logger } from "./logger.js";
 import { State, ensureDailyVolume, noteSeenTrade } from "./state.js";
+import { TelegramNotifier } from "./telegram.js";
 import { ActivityTrade, Position } from "./types.js";
 import { formatUsd, isPositive, nowSec } from "./utils.js";
+
+const shortAddr = (addr: string): string =>
+  addr.length > 10 ? `${addr.slice(0, 6)}…${addr.slice(-4)}` : addr;
+
+const marketLabel = (trade: ActivityTrade): string => {
+  const title = trade.title ?? trade.asset;
+  const outcome = trade.outcome ? ` (${trade.outcome})` : "";
+  return `${title}${outcome}`;
+};
+
+/** Builds the "a trade was noticed" block shared by every notification. */
+const tradeHeader = (trade: ActivityTrade): string => {
+  const when = new Date(trade.timestamp * 1000).toISOString().replace("T", " ").slice(0, 19);
+  return [
+    `🔎 <b>Замечена сделка</b>`,
+    `Трейдер: <code>${shortAddr(trade.proxyWallet)}</code>`,
+    `Рынок: ${marketLabel(trade)}`,
+    `Сторона: ${trade.side}`,
+    `Цена: ${trade.price}`,
+    `Размер: ${trade.size} shares (~$${formatUsd(trade.usdcSize)})`,
+    `Время сделки: ${when} UTC`,
+  ].join("\n");
+};
 
 class PositionCache {
   private lastFetch = 0;
@@ -40,9 +64,17 @@ export class CopyTrader {
     private clob: ClobService,
     private dataApi: DataApiClient,
     private state: State,
-    private logger: Logger
+    private logger: Logger,
+    private notifier?: TelegramNotifier
   ) {
     this.positionCache = new PositionCache(dataApi, config.profileAddress, 30000, logger);
+  }
+
+  /** Fire-and-forget Telegram notification; never blocks or throws. */
+  private notify(trade: ActivityTrade, resultLine: string): void {
+    if (!this.notifier) return;
+    const text = `${tradeHeader(trade)}\n\n${resultLine}`;
+    void this.notifier.send(text);
   }
 
   private tradeKey(trade: ActivityTrade): string {
@@ -151,7 +183,13 @@ export class CopyTrader {
   }
 
   async handleTrade(trade: ActivityTrade): Promise<void> {
-    if (!this.shouldCopySide(trade)) return;
+    if (!this.shouldCopySide(trade)) {
+      this.notify(
+        trade,
+        `⏭ <b>Пропущена</b>: сторона ${trade.side} не копируется (COPY_SIDE=${this.config.copySide})`,
+      );
+      return;
+    }
 
     const tradeKey = this.tradeKey(trade);
     if (this.state.seenTrades[tradeKey]) return;
@@ -164,6 +202,10 @@ export class CopyTrader {
 
     const computed = this.computeSize(trade);
     if (!computed) {
+      this.notify(
+        trade,
+        `⏭ <b>Пропущена</b>: не удалось рассчитать размер ордера (некорректная цена или стратегия ${this.config.copyStrategy})`,
+      );
       return;
     }
 
@@ -173,6 +215,10 @@ export class CopyTrader {
 
     const clamped = this.clampToLimits(side, size, notional, trade.price);
     if (!clamped) {
+      this.notify(
+        trade,
+        `⏭ <b>Пропущена</b>: не прошла по лимитам (MIN_TRADE_USD/MAX_TRADE_USD/дневной лимит MAX_DAILY_VOLUME_USD)`,
+      );
       noteSeenTrade(this.state, tradeKey, trade.timestamp);
       return;
     }
@@ -181,6 +227,10 @@ export class CopyTrader {
 
     const positionClamped = await this.clampToPosition(side, trade.asset, size, notional, trade.price);
     if (!positionClamped) {
+      this.notify(
+        trade,
+        `⏭ <b>Пропущена</b>: лимит по позиции исчерпан (MAX_POSITION_SIZE_USD) или нечего продавать`,
+      );
       noteSeenTrade(this.state, tradeKey, trade.timestamp);
       return;
     }
@@ -195,6 +245,10 @@ export class CopyTrader {
         size,
         notional: formatUsd(notional),
       });
+      this.notify(
+        trade,
+        `🧪 <b>DRY RUN</b>: ордер был бы размещён — размер ${size.toFixed(4)} shares (~$${formatUsd(notional)})`,
+      );
       noteSeenTrade(this.state, tradeKey, trade.timestamp);
       return;
     }
@@ -218,6 +272,10 @@ export class CopyTrader {
         size,
         notional: formatUsd(notional),
       });
+      this.notify(
+        trade,
+        `✅ <b>Скопировано</b>: ордер размещён — ${size.toFixed(4)} shares (~$${formatUsd(notional)}) по цене ${trade.price}`,
+      );
     } catch (err) {
       const message = (err as Error).message ?? "unknown error";
       if (message.includes("not enough balance") || message.includes("allowance")) {
@@ -227,6 +285,7 @@ export class CopyTrader {
         });
       }
       this.logger.warn("Order failed", { error: message });
+      this.notify(trade, `❌ <b>Ошибка размещения ордера</b>: ${message}`);
     } finally {
       noteSeenTrade(this.state, tradeKey, trade.timestamp);
     }
