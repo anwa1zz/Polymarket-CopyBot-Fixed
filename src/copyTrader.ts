@@ -11,24 +11,75 @@ import { formatUsd, isPositive, nowSec } from "./utils.js";
 const shortAddr = (addr: string): string =>
   addr.length > 10 ? `${addr.slice(0, 6)}…${addr.slice(-4)}` : addr;
 
-const marketLabel = (trade: ActivityTrade): string => {
-  const title = trade.title ?? trade.asset;
-  const outcome = trade.outcome ? ` (${trade.outcome})` : "";
-  return `${title}${outcome}`;
+/** Trims float noise: 0.8523974082073434 -> "0.8524", 0.9960000000000001 -> "0.996" */
+const formatPrice = (price: number): string => String(parseFloat(price.toFixed(4)));
+
+const truncate = (s: string, max = 70): string => (s.length > max ? `${s.slice(0, max - 1)}…` : s);
+
+type NotifyStatus = "copied" | "skipped" | "dryrun" | "error";
+
+const STATUS_META: Record<NotifyStatus, { emoji: string; label: string }> = {
+  copied: { emoji: "✅", label: "СКОПИРОВАНО" },
+  skipped: { emoji: "⏭", label: "ПРОПУЩЕНО" },
+  dryrun: { emoji: "🧪", label: "ТЕСТОВЫЙ РЕЖИМ" },
+  error: { emoji: "❌", label: "ОШИБКА" },
 };
 
-/** Builds the "a trade was noticed" block shared by every notification. */
-const tradeHeader = (trade: ActivityTrade): string => {
-  const when = new Date(trade.timestamp * 1000).toISOString().replace("T", " ").slice(0, 19);
-  return [
-    `🔎 <b>Замечена сделка</b>`,
-    `Трейдер: <code>${shortAddr(trade.proxyWallet)}</code>`,
-    `Рынок: ${marketLabel(trade)}`,
-    `Сторона: ${trade.side}`,
-    `Цена: ${trade.price}`,
-    `Размер: ${trade.size} shares (~$${formatUsd(trade.usdcSize)})`,
-    `Время сделки: ${when} UTC`,
-  ].join("\n");
+/**
+ * Error/skip reasons can come either from our own code (already Russian) or
+ * verbatim from the Polymarket CLOB API (always English, e.g. "no orders
+ * found to match with FAK order..."). This maps the known API/library
+ * messages to Russian so notifications read as one language end to end.
+ * Unrecognized messages fall through untranslated rather than being hidden,
+ * so nothing gets lost for troubleshooting.
+ */
+const translateReason = (raw: string): string => {
+  const patterns: [RegExp, string][] = [
+    [/no orders found to match/i, "нет встречной ликвидности по этой цене — ордер отменён биржей"],
+    [/not enough balance/i, "недостаточно USDC на балансе Polymarket"],
+    [/allowance/i, "не выставлен allowance USDC (включается один раз в настройках Polymarket)"],
+    [/below the market minimum/i, "размер ордера меньше минимального, разрешённого для этого рынка"],
+    [/Invalid market order amount/i, "не удалось посчитать сумму ордера (некорректная цена или размер)"],
+    [/Order not filled/i, "ордер не нашёл встречной ликвидности и не исполнился"],
+    [/CLOB rejected the order/i, "биржа отклонила ордер"],
+  ];
+  for (const [re, ru] of patterns) {
+    if (re.test(raw)) return ru;
+  }
+  return raw;
+};
+
+/**
+ * Compact, scannable Telegram message: status + side up top (the thing you
+ * actually need at a glance when many trades come in), market name, the
+ * trader's numbers on one line, an optional reason, an optional line for
+ * what WE did (only meaningfully different from the trader's numbers when
+ * copied), and a short time — instead of one field per line.
+ */
+const formatNotification = (params: {
+  trade: ActivityTrade;
+  marketTitle: string | undefined;
+  status: NotifyStatus;
+  reason?: string;
+  ourOrder?: string;
+}): string => {
+  const { trade, marketTitle, status, reason, ourOrder } = params;
+  const { emoji, label } = STATUS_META[status];
+  const outcome = trade.outcome ? ` (${trade.outcome})` : "";
+  const market = truncate(
+    `${marketTitle ?? trade.title ?? `токен ${trade.asset.slice(0, 10)}…`}${outcome}`,
+  );
+  const when = new Date(trade.timestamp * 1000).toISOString().slice(11, 16);
+
+  const lines = [
+    `${emoji} <b>${label}</b> · ${trade.side}`,
+    market,
+    `Трейдер: ${formatPrice(trade.price)} · ${trade.size} шт (~$${formatUsd(trade.usdcSize)}) · <code>${shortAddr(trade.proxyWallet)}</code>`,
+  ];
+  if (ourOrder) lines.push(`Твой ордер: ${ourOrder}`);
+  if (reason) lines.push(`Причина: ${truncate(reason, 160)}`);
+  lines.push(`${when} UTC`);
+  return lines.join("\n");
 };
 
 class PositionCache {
@@ -71,10 +122,23 @@ export class CopyTrader {
   }
 
   /** Fire-and-forget Telegram notification; never blocks or throws. */
-  private notify(trade: ActivityTrade, resultLine: string): void {
+  private notify(
+    trade: ActivityTrade,
+    status: NotifyStatus,
+    opts?: { reason?: string; ourOrder?: string },
+  ): void {
     if (!this.notifier) return;
-    const text = `${tradeHeader(trade)}\n\n${resultLine}`;
-    void this.notifier.send(text);
+    void (async () => {
+      const marketTitle = trade.title ?? (await this.dataApi.getMarketTitle(trade.asset));
+      const text = formatNotification({
+        trade,
+        marketTitle,
+        status,
+        reason: opts?.reason,
+        ourOrder: opts?.ourOrder,
+      });
+      await this.notifier!.send(text);
+    })();
   }
 
   private tradeKey(trade: ActivityTrade): string {
@@ -184,10 +248,9 @@ export class CopyTrader {
 
   async handleTrade(trade: ActivityTrade): Promise<void> {
     if (!this.shouldCopySide(trade)) {
-      this.notify(
-        trade,
-        `⏭ <b>Пропущена</b>: сторона ${trade.side} не копируется (COPY_SIDE=${this.config.copySide})`,
-      );
+      this.notify(trade, "skipped", {
+        reason: `сторона ${trade.side} не копируется (COPY_SIDE=${this.config.copySide})`,
+      });
       return;
     }
 
@@ -202,10 +265,9 @@ export class CopyTrader {
 
     const computed = this.computeSize(trade);
     if (!computed) {
-      this.notify(
-        trade,
-        `⏭ <b>Пропущена</b>: не удалось рассчитать размер ордера (некорректная цена или стратегия ${this.config.copyStrategy})`,
-      );
+      this.notify(trade, "skipped", {
+        reason: `не удалось рассчитать размер ордера (некорректная цена или стратегия ${this.config.copyStrategy})`,
+      });
       return;
     }
 
@@ -215,10 +277,9 @@ export class CopyTrader {
 
     const clamped = this.clampToLimits(side, size, notional, trade.price);
     if (!clamped) {
-      this.notify(
-        trade,
-        `⏭ <b>Пропущена</b>: не прошла по лимитам (MIN_TRADE_USD/MAX_TRADE_USD/дневной лимит MAX_DAILY_VOLUME_USD)`,
-      );
+      this.notify(trade, "skipped", {
+        reason: "не прошла по лимитам (MIN_TRADE_USD/MAX_TRADE_USD/дневной лимит MAX_DAILY_VOLUME_USD)",
+      });
       noteSeenTrade(this.state, tradeKey, trade.timestamp);
       return;
     }
@@ -227,10 +288,9 @@ export class CopyTrader {
 
     const positionClamped = await this.clampToPosition(side, trade.asset, size, notional, trade.price);
     if (!positionClamped) {
-      this.notify(
-        trade,
-        `⏭ <b>Пропущена</b>: лимит по позиции исчерпан (MAX_POSITION_SIZE_USD) или нечего продавать`,
-      );
+      this.notify(trade, "skipped", {
+        reason: "лимит по позиции исчерпан (MAX_POSITION_SIZE_USD) или нечего продавать",
+      });
       noteSeenTrade(this.state, tradeKey, trade.timestamp);
       return;
     }
@@ -245,16 +305,15 @@ export class CopyTrader {
         size,
         notional: formatUsd(notional),
       });
-      this.notify(
-        trade,
-        `🧪 <b>DRY RUN</b>: ордер был бы размещён — размер ${size.toFixed(4)} shares (~$${formatUsd(notional)})`,
-      );
+      this.notify(trade, "dryrun", {
+        ourOrder: `${size.toFixed(4)} шт (~$${formatUsd(notional)}) — не отправлено (включён тестовый режим)`,
+      });
       noteSeenTrade(this.state, tradeKey, trade.timestamp);
       return;
     }
 
     try {
-      await this.clob.placeLimitOrder({
+      const fill = await this.clob.placeLimitOrder({
         tokenId: trade.asset,
         side,
         price: trade.price,
@@ -271,11 +330,11 @@ export class CopyTrader {
         price: trade.price,
         size,
         notional: formatUsd(notional),
+        fill,
       });
-      this.notify(
-        trade,
-        `✅ <b>Скопировано</b>: ордер размещён — ${size.toFixed(4)} shares (~$${formatUsd(notional)}) по цене ${trade.price}`,
-      );
+      this.notify(trade, "copied", {
+        ourOrder: `${size.toFixed(4)} шт (~$${formatUsd(notional)}) по ${formatPrice(trade.price)}`,
+      });
     } catch (err) {
       const message = (err as Error).message ?? "unknown error";
       if (message.includes("not enough balance") || message.includes("allowance")) {
@@ -285,7 +344,7 @@ export class CopyTrader {
         });
       }
       this.logger.warn("Order failed", { error: message });
-      this.notify(trade, `❌ <b>Ошибка размещения ордера</b>: ${message}`);
+      this.notify(trade, "error", { reason: translateReason(message) });
     } finally {
       noteSeenTrade(this.state, tradeKey, trade.timestamp);
     }
