@@ -3,6 +3,7 @@ import { Wallet, utils } from "ethers";
 export type CopyStrategy = "PERCENT_USD" | "PERCENT_SHARES" | "FIXED_USD" | "FIXED_SHARES";
 export type CopySide = "BUY" | "SELL" | "BOTH";
 export type RelayerTxTypeOption = "SAFE" | "PROXY";
+export type OrderMode = "MARKET" | "LIMIT";
 
 export interface ApiCreds {
   key: string;
@@ -37,6 +38,8 @@ export interface Config {
   maxPositionSizeUsd: number;
   copySide: CopySide;
   maxSlippagePct: number;
+  orderMode: OrderMode;
+  limitOffsetPct: number;
   pollIntervalMs: number;
   tradeLookbackSec: number;
   stateFile: string;
@@ -125,6 +128,13 @@ const normalizeTxType = (raw?: string): RelayerTxTypeOption => {
   throw new ConfigError(`Unsupported RELAYER_TX_TYPE: ${raw}`);
 };
 
+const normalizeOrderMode = (raw?: string): OrderMode => {
+  if (!raw) return "MARKET";
+  const val = raw.toUpperCase();
+  if (val === "MARKET" || val === "LIMIT") return val;
+  throw new ConfigError(`Unsupported ORDER_MODE: ${raw} (expected MARKET or LIMIT)`);
+};
+
 const parseTraderAllocations = (raw?: string): Record<string, number> => {
   if (!raw) return {};
   const out: Record<string, number> = {};
@@ -191,6 +201,8 @@ export const loadConfig = (): Config => {
 
   const copySide = normalizeSide(getEnv("COPY_SIDE"));
   const maxSlippagePct = parseNumber("MAX_SLIPPAGE_PCT", 3);
+  const orderMode = normalizeOrderMode(getEnv("ORDER_MODE"));
+  const limitOffsetPct = parseNumber("LIMIT_OFFSET_PCT", 2);
   const pollIntervalMs = parseNumber("POLL_INTERVAL_MS", 5000);
   const tradeLookbackSec = parseNumber("TRADE_LOOKBACK_SEC", 300);
   const stateFile = getEnv("STATE_FILE") ?? "./data/state.json";
@@ -255,6 +267,8 @@ export const loadConfig = (): Config => {
     maxPositionSizeUsd,
     copySide,
     maxSlippagePct,
+    orderMode,
+    limitOffsetPct,
     pollIntervalMs,
     tradeLookbackSec,
     stateFile,
