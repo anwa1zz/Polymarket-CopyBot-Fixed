@@ -231,7 +231,7 @@ export class CopyTrader {
       noteSeenTrade(this.state, tradeKey, trade.timestamp);
     }
   }
-
+/*
   async runOnce(): Promise<void> {
   const now = nowSec();
 
@@ -287,3 +287,4 @@ export class CopyTrader {
   );
   }
 }
+*/
