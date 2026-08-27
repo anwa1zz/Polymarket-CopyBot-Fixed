@@ -257,4 +257,103 @@ export class ClobService {
       filledUsdc: respAny.takingAmount,
     };
   }
+
+  /**
+   * GTC (Good-Till-Cancelled) limit order — used when ORDER_MODE=LIMIT.
+   *
+   * Unlike the market FAK order above, this does NOT require immediate full
+   * liquidity: if only part fills right away, the rest just sits on the book
+   * as a resting order until it fills or is cancelled (no time limit here).
+   *
+   * The price is shifted away from the trader's original price by
+   * `offsetPct` in the direction that makes the order MORE aggressive
+   * (crosses further into the book), which is what makes it likely to fill
+   * fast instead of sitting unfilled at the exact price the other trader got:
+   *   BUY  -> price * (1 + offsetPct/100)  (willing to pay a bit more)
+   *   SELL -> price * (1 - offsetPct/100)  (willing to accept a bit less)
+   */
+  async placeGtcLimitOrder(params: {
+    tokenId: string;
+    side: Side;
+    price: number;
+    size: number;
+    offsetPct?: number;
+  }): Promise<{ status: string; orderId?: string; filledSize?: string; filledUsdc?: string }> {
+    const { tokenId, side, size } = params;
+
+    const meta = await this.getMarketMeta(tokenId);
+
+    const offsetPct = params.offsetPct ?? 2;
+    const rawOffsetPrice =
+      side === Side.BUY
+        ? params.price * (1 + offsetPct / 100)
+        : params.price * (1 - offsetPct / 100);
+
+    // Keep inside Polymarket's valid price range (0.001–0.999) — see the
+    // same note in placeLimitOrder() above.
+    const boundedPrice = Math.min(0.999, Math.max(0.001, rawOffsetPrice));
+    const price = this.roundToTick(boundedPrice, meta.tickSize, side);
+
+    if (size < meta.minOrderSize) {
+      throw new Error(
+        `Order size ${size} is below the market minimum ${meta.minOrderSize} — not submitted.`
+      );
+    }
+
+    const resp = await this.client.createAndPostOrder(
+      {
+        tokenID: tokenId,
+        price,
+        size,
+        side,
+      },
+      {
+        tickSize: meta.tickSize as any,
+        negRisk: meta.negRisk,
+      },
+      OrderType.GTC,
+    );
+
+    this.logger.info("GTC limit order submitted", {
+      tokenId,
+      side,
+      price,
+      offsetPct,
+      referencePrice: params.price,
+      size,
+      response: resp,
+    });
+
+    // Same response-shape handling as the market order above: a rejection
+    // comes back as a raw error body rather than a thrown exception.
+    const respAny = resp as unknown as {
+      success?: boolean;
+      status?: string | number;
+      orderID?: string;
+      error?: string;
+      errorMsg?: string;
+      makingAmount?: string;
+      takingAmount?: string;
+    };
+
+    // Same rule as the market order above: `success: true` is the
+    // authoritative signal that the CLOB accepted the order. Unlike the
+    // market FAK order, a GTC order doesn't need to fill immediately to
+    // count as accepted — it can also come back as "live" (resting on the
+    // book, waiting to fill) rather than "matched" (filled right away), and
+    // both are a success here. We don't gate on the exact status string
+    // beyond that since the CLOB's full status vocabulary isn't part of the
+    // SDK's public types — only `success` is documented/stable.
+    if (respAny.success !== true) {
+      const reason = respAny.error || respAny.errorMsg || `CLOB rejected the order (status: ${respAny.status})`;
+      throw new Error(reason);
+    }
+
+    return {
+      status: String(respAny.status ?? "accepted"),
+      orderId: respAny.orderID,
+      filledSize: respAny.makingAmount,
+      filledUsdc: respAny.takingAmount,
+    };
+  }
 }
