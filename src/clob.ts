@@ -134,6 +134,7 @@ export class ClobService {
     side: Side;
     price: number;
     size: number;
+    maxSlippagePct?: number;
   }): Promise<void> {
     const { tokenId, side } = params;
 
@@ -141,6 +142,22 @@ export class ClobService {
 
     const price = this.roundToTick(
       params.price,
+      meta.tickSize,
+      side,
+    );
+
+    // Worst acceptable execution price. Without this, createAndPostMarketOrder
+    // sweeps the book with NO price cap at all — it will fill at any price
+    // available until the requested USDC amount is exhausted. This is what
+    // caused fills far above the reference price (e.g. 95c instead of 54c).
+    const slippagePct = params.maxSlippagePct ?? 3;
+    const worstPrice =
+      side === Side.BUY
+        ? price * (1 + slippagePct / 100)
+        : price * (1 - slippagePct / 100);
+
+    const cappedWorstPrice = this.roundToTick(
+      Math.min(0.99, Math.max(0.01, worstPrice)),
       meta.tickSize,
       side,
     );
@@ -192,6 +209,7 @@ export class ClobService {
         tokenID: tokenId,
         amount,
         side,
+        price: cappedWorstPrice,
         orderType: OrderType.FAK,
       },
       {
@@ -206,6 +224,7 @@ export class ClobService {
       side,
       amount,
       price,
+      worstPrice: cappedWorstPrice,
       size,
       response: resp,
     });
