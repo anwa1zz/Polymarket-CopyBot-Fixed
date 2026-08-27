@@ -222,30 +222,56 @@ export class CopyTrader {
   }
 
   async runOnce(): Promise<void> {
-    const now = nowSec();
+  const now = nowSec();
 
-    for (const trader of this.config.copyTraders) {
+  await Promise.all(
+    this.config.copyTraders.map(async (trader) => {
       this.logger.debug("Polling trader", { trader });
+
       const last = this.state.lastSeen[trader];
-      const start = last ? last + 1 : now - this.config.tradeLookbackSec;
+      const start = last
+        ? last + 1
+        : now - this.config.tradeLookbackSec;
 
       let trades: ActivityTrade[] = [];
+
       try {
-        trades = await this.dataApi.getTrades(trader, start, now, 100);
+        trades = await this.dataApi.getTrades(
+          trader,
+          start,
+          now,
+          100,
+        );
       } catch (err) {
-        this.logger.warn("Failed to fetch trades", { trader, error: (err as Error).message });
-        continue;
+        this.logger.warn("Failed to fetch trades", {
+          trader,
+          error: (err as Error).message,
+        });
+        return;
       }
 
       if (trades.length === 0) {
-        this.logger.debug("No trades found", { trader, start, end: now });
-        continue;
+        this.logger.debug("No trades found", {
+          trader,
+          start,
+          end: now,
+        });
+        return;
       }
+
+      this.logger.info("Trades detected", {
+        trader,
+        count: trades.length,
+      });
 
       for (const trade of trades) {
         await this.handleTrade(trade);
-        this.state.lastSeen[trader] = Math.max(this.state.lastSeen[trader] || 0, trade.timestamp);
+
+        this.state.lastSeen[trader] = Math.max(
+          this.state.lastSeen[trader] || 0,
+          trade.timestamp,
+        );
       }
-    }
-  }
+    }),
+  );
 }
