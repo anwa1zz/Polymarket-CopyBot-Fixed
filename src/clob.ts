@@ -150,6 +150,12 @@ export class ClobService {
     // sweeps the book with NO price cap at all — it will fill at any price
     // available until the requested USDC amount is exhausted. This is what
     // caused fills far above the reference price (e.g. 95c instead of 54c).
+    //
+    // The safety bound itself must stay inside Polymarket's actual valid
+    // price range (0.001–0.999) rather than an arbitrary round number —
+    // markets close to resolution routinely trade at 0.99+ / 0.01-, and a
+    // hard 0.99 ceiling would silently block copying those trades no
+    // matter how high MAX_SLIPPAGE_PCT is set.
     const slippagePct = params.maxSlippagePct ?? 3;
     const worstPrice =
       side === Side.BUY
@@ -157,7 +163,7 @@ export class ClobService {
         : price * (1 - slippagePct / 100);
 
     const cappedWorstPrice = this.roundToTick(
-      Math.min(0.99, Math.max(0.01, worstPrice)),
+      Math.min(0.999, Math.max(0.001, worstPrice)),
       meta.tickSize,
       side,
     );
