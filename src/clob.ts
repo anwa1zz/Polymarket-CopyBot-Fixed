@@ -135,7 +135,7 @@ export class ClobService {
     price: number;
     size: number;
     maxSlippagePct?: number;
-  }): Promise<void> {
+  }): Promise<{ status: string; filledSize?: string; filledUsdc?: string }> {
     const { tokenId, side } = params;
 
     const meta = await this.getMarketMeta(tokenId);
@@ -165,13 +165,9 @@ export class ClobService {
     const size = params.size;
 
     if (size < meta.minOrderSize) {
-      this.logger.warn("Order size below minimum", {
-        tokenId,
-        size,
-        min: meta.minOrderSize,
-      });
-
-      return;
+      throw new Error(
+        `Order size ${size} is below the market minimum ${meta.minOrderSize} — not submitted.`
+      );
     }
 
     /*
@@ -193,15 +189,7 @@ export class ClobService {
         : size;
 
     if (!Number.isFinite(amount) || amount <= 0) {
-      this.logger.warn("Invalid market order amount", {
-        tokenId,
-        side,
-        amount,
-        price,
-        size,
-      });
-
-      return;
+      throw new Error(`Invalid market order amount computed (${amount}) for tokenId=${tokenId}`);
     }
 
     const resp = await this.client.createAndPostMarketOrder(
@@ -228,5 +216,39 @@ export class ClobService {
       size,
       response: resp,
     });
+
+    // The client can resolve with two different shapes depending on what
+    // the CLOB returned:
+    //  - a real OrderResponse: { success, status, orderID, makingAmount, ... }
+    //  - a raw error body on rejection: { error, orderID, status } where
+    //    `status` here is an HTTP status code (e.g. 400), not "matched" —
+    //    e.g. "no orders found to match with FAK order" when there's no
+    //    counter-liquidity to fill against.
+    // Treat anything that isn't an explicit `success: true` + status
+    // "matched" as a non-fill, using whichever error field is present.
+    const respAny = resp as unknown as {
+      success?: boolean;
+      status?: string | number;
+      error?: string;
+      errorMsg?: string;
+      makingAmount?: string;
+      takingAmount?: string;
+    };
+
+    if (respAny.success !== true) {
+      const reason = respAny.error || respAny.errorMsg || `CLOB rejected the order (status: ${respAny.status})`;
+      throw new Error(reason);
+    }
+    if (respAny.status !== "matched") {
+      throw new Error(
+        `Order not filled — status "${respAny.status}" (no counter-liquidity for a FAK order; nothing was bought/sold)`
+      );
+    }
+
+    return {
+      status: String(respAny.status),
+      filledSize: respAny.makingAmount,
+      filledUsdc: respAny.takingAmount,
+    };
   }
 }
