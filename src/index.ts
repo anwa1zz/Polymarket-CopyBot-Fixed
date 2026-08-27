@@ -6,6 +6,7 @@ import { ClobService } from "./clob.js";
 import { DataApiClient } from "./dataApi.js";
 import { CopyTrader } from "./copyTrader.js";
 import { RedeemService } from "./redeem.js";
+import { OnchainListener } from "./onchainListener.js";
 import {
   loadState,
   markRedeemAttempt,
@@ -57,6 +58,29 @@ const main = async () => {
 
   const dataApi = new DataApiClient(config.dataApiHost, logger);
   const copyTrader = new CopyTrader(config, clob, dataApi, state, logger);
+
+  let onchainListener: OnchainListener | null = null;
+  if (config.onchainWssUrl) {
+    onchainListener = new OnchainListener({
+      wssUrl: config.onchainWssUrl,
+      copyTraders: config.copyTraders,
+      onTrade: async (trade) => {
+        // Same de-dupe key as the REST path, so if both paths ever see the
+        // same fill (e.g. right after a reconnect), it's only acted on once.
+        await copyTrader.handleTrade(trade);
+      },
+      logger,
+    });
+    onchainListener.start();
+    logger.info(
+      "Real-time on-chain listener active. REST polling continues in the background as a fallback (slower interval) in case the WebSocket connection drops.",
+    );
+  } else {
+    logger.warn(
+      "ONCHAIN_WSS_URL not set — running on REST polling only. This is significantly slower to react to trades. Set ONCHAIN_WSS_URL (a wss:// RPC endpoint, e.g. from Alchemy) for real-time detection.",
+    );
+  }
+
 
   const redeemService = config.autoRedeem
     ? RedeemService.init(
