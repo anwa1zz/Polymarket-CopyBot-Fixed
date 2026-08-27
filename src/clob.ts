@@ -129,7 +129,7 @@ export class ClobService {
     return rounded / factor;
   }
 
-  async placeLimitOrder(params: {
+    async placeLimitOrder(params: {
     tokenId: string;
     side: Side;
     price: number;
@@ -146,8 +146,11 @@ export class ClobService {
       side,
     );
 
-    // ⚡ УВЕЛИЧИЛ ПРОСКАЛЬЗЫВАНИЕ ДО 5% (было 3%)
-    const slippagePct = params.maxSlippagePct ?? 5;
+    // Worst acceptable execution price. Without this, createAndPostMarketOrder
+    // sweeps the book with NO price cap at all — it will fill at any price
+    // available until the requested USDC amount is exhausted. This is what
+    // caused fills far above the reference price (e.g. 95c instead of 54c).
+    const slippagePct = params.maxSlippagePct ?? 3;
     const worstPrice =
       side === Side.BUY
         ? price * (1 + slippagePct / 100)
@@ -172,7 +175,7 @@ export class ClobService {
     }
 
     /*
-     * Market IOC order (было FAK, теперь IOC)
+     * Market FAK order.
      *
      * BUY:
      *   amount = USDC to spend.
@@ -201,23 +204,22 @@ export class ClobService {
       return;
     }
 
-    // ⚡ ЗАМЕНИЛ FAK НА IOC
     const resp = await this.client.createAndPostMarketOrder(
       {
         tokenID: tokenId,
         amount,
         side,
         price: cappedWorstPrice,
-        orderType: OrderType.IOC,
+        orderType: OrderType.FAK,
       },
       {
         tickSize: meta.tickSize as any,
         negRisk: meta.negRisk,
       },
-      OrderType.IOC,
+      OrderType.FAK,
     );
 
-    this.logger.info("Market IOC order submitted", {
+    this.logger.info("Market FAK order submitted", {
       tokenId,
       side,
       amount,
