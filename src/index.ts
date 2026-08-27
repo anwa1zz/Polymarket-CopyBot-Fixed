@@ -7,6 +7,7 @@ import { DataApiClient } from "./dataApi.js";
 import { CopyTrader } from "./copyTrader.js";
 import { RedeemService } from "./redeem.js";
 import { OnchainListener } from "./onchainListener.js";
+import { createTelegramNotifier } from "./telegram.js";
 import {
   loadState,
   markRedeemAttempt,
@@ -57,7 +58,22 @@ const main = async () => {
   );
 
   const dataApi = new DataApiClient(config.dataApiHost, logger);
-  const copyTrader = new CopyTrader(config, clob, dataApi, state, logger);
+  const telegramNotifier = createTelegramNotifier(
+    config.telegramBotToken,
+    config.telegramChatId,
+    logger,
+  );
+  if (telegramNotifier) {
+    logger.info("Telegram notifications enabled.");
+    void telegramNotifier.send(
+      "🤖 Бот запущен и подключён к уведомлениям Telegram.",
+    );
+  } else {
+    logger.warn(
+      "TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set — Telegram notifications disabled.",
+    );
+  }
+  const copyTrader = new CopyTrader(config, clob, dataApi, state, logger, telegramNotifier);
 
   let onchainListener: OnchainListener | null = null;
   if (config.onchainWssUrl) {
