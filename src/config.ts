@@ -36,6 +36,7 @@ export interface Config {
   maxDailyVolumeUsd: number;
   maxPositionSizeUsd: number;
   copySide: CopySide;
+  maxSlippagePct: number;
   pollIntervalMs: number;
   tradeLookbackSec: number;
   stateFile: string;
@@ -49,6 +50,7 @@ export interface Config {
   builderSigningUrl?: string;
   builderSigningToken?: string;
   rpcUrl?: string;
+  onchainWssUrl?: string;
   maxSeenTradesAgeSec: number;
 }
 
@@ -186,6 +188,7 @@ export const loadConfig = (): Config => {
   const maxPositionSizeUsd = parseNumber("MAX_POSITION_SIZE_USD");
 
   const copySide = normalizeSide(getEnv("COPY_SIDE"));
+  const maxSlippagePct = parseNumber("MAX_SLIPPAGE_PCT", 3);
   const pollIntervalMs = parseNumber("POLL_INTERVAL_MS", 5000);
   const tradeLookbackSec = parseNumber("TRADE_LOOKBACK_SEC", 300);
   const stateFile = getEnv("STATE_FILE") ?? "./data/state.json";
@@ -207,6 +210,7 @@ export const loadConfig = (): Config => {
   const builderSigningUrl = getEnv("BUILDER_SIGNING_URL");
   const builderSigningToken = getEnv("BUILDER_SIGNING_TOKEN");
   const rpcUrl = getEnv("RPC_URL");
+  const onchainWssUrl = getEnv("ONCHAIN_WSS_URL");
 
   if (!profileAddress) {
     throw new ConfigError("PROFILE_ADDRESS or FUNDER_ADDRESS is required to query your positions.");
@@ -245,6 +249,7 @@ export const loadConfig = (): Config => {
     maxDailyVolumeUsd,
     maxPositionSizeUsd,
     copySide,
+    maxSlippagePct,
     pollIntervalMs,
     tradeLookbackSec,
     stateFile,
@@ -258,6 +263,7 @@ export const loadConfig = (): Config => {
     builderSigningUrl,
     builderSigningToken,
     rpcUrl,
+    onchainWssUrl,
     maxSeenTradesAgeSec,
   };
 };
