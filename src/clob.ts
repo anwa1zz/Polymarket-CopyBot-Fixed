@@ -129,7 +129,7 @@ export class ClobService {
     return rounded / factor;
   }
 
-  async placeLimitOrder(params: {
+    async placeLimitOrder(params: {
     tokenId: string;
     side: Side;
     price: number;
@@ -157,28 +157,56 @@ export class ClobService {
       return;
     }
 
-const resp = await this.client.createAndPostOrder(
-  {
-    tokenID: tokenId,
-    price,
-    side,
-    size,
-  },
-  {
-    tickSize: meta.tickSize as any,
-    negRisk: meta.negRisk,
-  },
-  OrderType.FAK,
-);
+    /*
+     * Market FAK order.
+     *
+     * BUY:
+     *   amount = USDC to spend.
+     *
+     * SELL:
+     *   amount = number of shares to sell.
+     *
+     * The existing CopyTrader passes `size` as shares,
+     * so for BUY we convert shares -> approximate USDC
+     * using the observed execution price.
+     */
+    const amount =
+      side === Side.BUY
+        ? price * size
+        : size;
 
-this.logger.info("Order submitted", {
-  tokenId,
-  side,
-  price,
-  size,
-  response: resp,
-});
+    if (!Number.isFinite(amount) || amount <= 0) {
+      this.logger.warn("Invalid market order amount", {
+        tokenId,
+        side,
+        amount,
+        price,
+        size,
+      });
 
-}
+      return;
+    }
 
-}
+    const resp = await this.client.createAndPostMarketOrder(
+      {
+        tokenID: tokenId,
+        amount,
+        side,
+        orderType: OrderType.FAK,
+      },
+      {
+        tickSize: meta.tickSize as any,
+        negRisk: meta.negRisk,
+      },
+      OrderType.FAK,
+    );
+
+    this.logger.info("Market FAK order submitted", {
+      tokenId,
+      side,
+      amount,
+      price,
+      size,
+      response: resp,
+    });
+  }
