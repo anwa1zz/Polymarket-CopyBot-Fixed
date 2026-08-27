@@ -46,7 +46,12 @@ export class CopyTrader {
   }
 
   private tradeKey(trade: ActivityTrade): string {
-    return `${trade.transactionHash}:${trade.asset}:${trade.side}:${trade.size}:${trade.price}`;
+    // Rounded to avoid the same real-world fill being treated as two
+    // different trades when it's detected both via REST polling and the
+    // on-chain listener (their price/size math can differ by float dust).
+    const roundedPrice = trade.price.toFixed(6);
+    const roundedSize = trade.size.toFixed(6);
+    return `${trade.transactionHash}:${trade.asset}:${trade.side}:${roundedSize}:${roundedPrice}`;
   }
 
   private effectiveRatio(trader: string): number {
@@ -151,9 +156,14 @@ export class CopyTrader {
     const tradeKey = this.tradeKey(trade);
     if (this.state.seenTrades[tradeKey]) return;
 
+    // Mark as seen IMMEDIATELY (synchronously, before any `await`) so that if
+    // the REST poller and the on-chain listener both detect this same fill
+    // at nearly the same time, the second one to arrive sees it as already
+    // handled instead of racing past this check and placing a duplicate order.
+    noteSeenTrade(this.state, tradeKey, trade.timestamp);
+
     const computed = this.computeSize(trade);
     if (!computed) {
-      noteSeenTrade(this.state, tradeKey, trade.timestamp);
       return;
     }
 
@@ -195,6 +205,7 @@ export class CopyTrader {
         side,
         price: trade.price,
         size,
+        maxSlippagePct: this.config.maxSlippagePct,
       });
       if (side === Side.BUY) {
         ensureDailyVolume(this.state);
