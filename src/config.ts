@@ -52,6 +52,8 @@ export interface Config {
   rpcUrl?: string;
   onchainWssUrl?: string;
   maxSeenTradesAgeSec: number;
+  telegramBotToken?: string;
+  telegramChatId?: string;
 }
 
 export class ConfigError extends Error {
@@ -229,6 +231,9 @@ export const loadConfig = (): Config => {
 
   const maxSeenTradesAgeSec = parseNumber("MAX_SEEN_TRADES_AGE_SEC", 60 * 60 * 24 * 7);
 
+  const telegramBotToken = getEnv("TELEGRAM_BOT_TOKEN");
+  const telegramChatId = getEnv("TELEGRAM_CHAT_ID");
+
   return {
     clobHost,
     dataApiHost,
@@ -265,5 +270,7 @@ export const loadConfig = (): Config => {
     rpcUrl,
     onchainWssUrl,
     maxSeenTradesAgeSec,
+    telegramBotToken,
+    telegramChatId,
   };
 };
