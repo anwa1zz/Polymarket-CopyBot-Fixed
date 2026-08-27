@@ -168,7 +168,7 @@ const resp = await this.client.createAndPostOrder(
     tickSize: meta.tickSize as any,
     negRisk: meta.negRisk,
   },
-  OrderType.GTC,
+  OrderType.FAK,
 );
 
 this.logger.info("Order submitted", {
