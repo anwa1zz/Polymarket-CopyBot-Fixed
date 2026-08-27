@@ -275,7 +275,7 @@ export class CopyTrader {
         count: trades.length,
       });
 
-            for (const trade of trades) {
+      for (const trade of trades) {
         await this.handleTrade(trade);
 
         this.state.lastSeen[trader] = Math.max(
@@ -286,5 +286,4 @@ export class CopyTrader {
     }),
   );
   }
-}
 */
