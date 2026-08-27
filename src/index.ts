@@ -8,6 +8,7 @@ import { CopyTrader } from "./copyTrader.js";
 import { RedeemService } from "./redeem.js";
 import { OnchainListener } from "./onchainListener.js";
 import { createTelegramNotifier } from "./telegram.js";
+import { TelegramCommandListener } from "./telegramCommands.js";
 import {
   loadState,
   markRedeemAttempt,
@@ -74,6 +75,20 @@ const main = async () => {
     );
   }
   const copyTrader = new CopyTrader(config, clob, dataApi, state, logger, telegramNotifier);
+
+  let telegramCommandListener: TelegramCommandListener | null = null;
+  if (telegramNotifier && config.telegramBotToken && config.telegramChatId) {
+    telegramCommandListener = new TelegramCommandListener({
+      botToken: config.telegramBotToken,
+      chatId: config.telegramChatId,
+      state,
+      config,
+      notifier: telegramNotifier,
+      logger,
+      onStateChanged: () => saveState(config.stateFile, state),
+    });
+    logger.info("Telegram command listener enabled — any message in the chat gets a stats summary reply.");
+  }
 
   let onchainListener: OnchainListener | null = null;
   if (config.onchainWssUrl) {
@@ -164,7 +179,11 @@ const main = async () => {
     }
   };
 
-  await Promise.all([copyLoop(), redeemLoop()]);
+  await Promise.all([
+    copyLoop(),
+    redeemLoop(),
+    telegramCommandListener ? telegramCommandListener.start() : Promise.resolve(),
+  ]);
 };
 
 main().catch((err) => {
