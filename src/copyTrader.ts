@@ -327,18 +327,29 @@ export class CopyTrader {
     }
 
     try {
-      const fill = await this.clob.placeLimitOrder({
-        tokenId: trade.asset,
-        side,
-        price: trade.price,
-        size,
-        maxSlippagePct: this.config.maxSlippagePct,
-      });
+      const orderMode = this.config.orderMode;
+      const fill =
+        orderMode === "LIMIT"
+          ? await this.clob.placeGtcLimitOrder({
+              tokenId: trade.asset,
+              side,
+              price: trade.price,
+              size,
+              offsetPct: this.config.limitOffsetPct,
+            })
+          : await this.clob.placeLimitOrder({
+              tokenId: trade.asset,
+              side,
+              price: trade.price,
+              size,
+              maxSlippagePct: this.config.maxSlippagePct,
+            });
       if (side === Side.BUY) {
         ensureDailyVolume(this.state);
         this.state.dailyVolume.spentUsd += notional;
       }
       this.logger.info("Order placed", {
+        mode: orderMode,
         side: trade.side,
         tokenId: trade.asset,
         price: trade.price,
@@ -346,8 +357,12 @@ export class CopyTrader {
         notional: formatUsd(notional),
         fill,
       });
+      const ourOrderLabel =
+        orderMode === "LIMIT"
+          ? `${size.toFixed(4)} шт (~$${formatUsd(notional)}) лимиткой, статус: ${fill.status}`
+          : `${size.toFixed(4)} шт (~$${formatUsd(notional)}) по ${formatPrice(trade.price)}`;
       this.notify(trade, "copied", {
-        ourOrder: `${size.toFixed(4)} шт (~$${formatUsd(notional)}) по ${formatPrice(trade.price)}`,
+        ourOrder: ourOrderLabel,
       });
     } catch (err) {
       const message = (err as Error).message ?? "unknown error";
