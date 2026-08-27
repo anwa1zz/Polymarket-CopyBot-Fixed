@@ -3,10 +3,13 @@ import { ActivityTrade, Position } from "./types.js";
 
 export class DataApiClient {
   private host: string;
+  private gammaHost: string;
   private logger: Logger;
+  private marketTitleCache = new Map<string, { label: string; ts: number }>();
 
-  constructor(host: string, logger: Logger) {
+  constructor(host: string, logger: Logger, gammaHost = "https://gamma-api.polymarket.com") {
     this.host = host.replace(/\/$/, "");
+    this.gammaHost = gammaHost.replace(/\/$/, "");
     this.logger = logger;
   }
 
@@ -48,6 +51,33 @@ export class DataApiClient {
     } catch (err) {
       this.logger.warn("Failed to fetch positions", { error: (err as Error).message });
       return [];
+    }
+  }
+
+  /**
+   * Human-readable market question for a given CLOB token id, via
+   * Polymarket's public Gamma API. Market metadata is effectively static,
+   * so results are cached in-memory for the life of the process.
+   */
+  async getMarketTitle(tokenId: string): Promise<string | undefined> {
+    const cached = this.marketTitleCache.get(tokenId);
+    if (cached) return cached.label;
+
+    try {
+      const url = `${this.gammaHost}/markets?clob_token_ids=${tokenId}`;
+      const data = await this.fetchJson<Array<{ question?: string }>>(url);
+      const question = data[0]?.question;
+      if (question) {
+        this.marketTitleCache.set(tokenId, { label: question, ts: Date.now() });
+        return question;
+      }
+      return undefined;
+    } catch (err) {
+      this.logger.debug("Failed to fetch market title", {
+        tokenId,
+        error: (err as Error).message,
+      });
+      return undefined;
     }
   }
 }
