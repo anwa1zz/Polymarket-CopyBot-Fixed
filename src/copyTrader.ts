@@ -3,7 +3,7 @@ import { Config, CopyStrategy } from "./config.js";
 import { ClobService } from "./clob.js";
 import { DataApiClient } from "./dataApi.js";
 import { Logger } from "./logger.js";
-import { State, ensureDailyVolume, noteSeenTrade, recordTradeStat } from "./state.js";
+import { State, ensureDailyVolume, noteSeenTrade, recordTradeLogEntry, recordTradeStat } from "./state.js";
 import { TelegramNotifier } from "./telegram.js";
 import { ActivityTrade, Position } from "./types.js";
 import { formatUsd, isPositive, nowSec } from "./utils.js";
@@ -12,13 +12,13 @@ const shortAddr = (addr: string): string =>
   addr.length > 10 ? `${addr.slice(0, 6)}…${addr.slice(-4)}` : addr;
 
 /** Trims float noise: 0.8523974082073434 -> "0.8524", 0.9960000000000001 -> "0.996" */
-const formatPrice = (price: number): string => String(parseFloat(price.toFixed(4)));
+export const formatPrice = (price: number): string => String(parseFloat(price.toFixed(4)));
 
-const truncate = (s: string, max = 70): string => (s.length > max ? `${s.slice(0, max - 1)}…` : s);
+export const truncate = (s: string, max = 70): string => (s.length > max ? `${s.slice(0, max - 1)}…` : s);
 
-type NotifyStatus = "copied" | "skipped" | "dryrun" | "error";
+export type NotifyStatus = "copied" | "skipped" | "dryrun" | "error";
 
-const STATUS_META: Record<NotifyStatus, { emoji: string; label: string }> = {
+export const STATUS_META: Record<NotifyStatus, { emoji: string; label: string }> = {
   copied: { emoji: "✅", label: "СКОПИРОВАНО" },
   skipped: { emoji: "⏭", label: "ПРОПУЩЕНО" },
   dryrun: { emoji: "🧪", label: "ТЕСТОВЫЙ РЕЖИМ" },
@@ -122,10 +122,12 @@ export class CopyTrader {
   }
 
   /**
-   * Records the trade's outcome into stats (always) and fires a Telegram
+   * Records the trade's outcome into stats (always) and the per-trade log
+   * (always — this is what powers the Telegram "логи" reply, independent
+   * of whether push notifications are turned on), and fires a Telegram
    * notification (only if configured). `reasonCode` is a short, stable key
    * used to group reasons in the `/stats` summary — separate from the
-   * human-readable `reason` text shown in the per-trade notification.
+   * human-readable `reason` text shown in the per-trade notification/log.
    */
   private notify(
     trade: ActivityTrade,
@@ -137,9 +139,25 @@ export class CopyTrader {
     } else {
       recordTradeStat(this.state, status);
     }
-    if (!this.notifier) return;
     void (async () => {
       const marketTitle = trade.title ?? (await this.dataApi.getMarketTitle(trade.asset));
+      const outcome = trade.outcome ? ` (${trade.outcome})` : "";
+      const market = `${marketTitle ?? `токен ${trade.asset.slice(0, 10)}…`}${outcome}`;
+
+      recordTradeLogEntry(this.state, {
+        ts: new Date().toISOString(),
+        trader: trade.proxyWallet,
+        side: trade.side,
+        market,
+        traderPrice: trade.price,
+        traderSize: trade.size,
+        traderUsdc: trade.usdcSize,
+        status,
+        reason: opts?.reason,
+        ourOrder: opts?.ourOrder,
+      });
+
+      if (!this.notifier) return;
       const text = formatNotification({
         trade,
         marketTitle,
