@@ -15,6 +15,21 @@ export interface Stats {
   errorReasons: Record<string, number>;
 }
 
+export interface TradeLogEntry {
+  /** UTC ISO timestamp of when this trade was processed. */
+  ts: string;
+  trader: string;
+  side: "BUY" | "SELL";
+  /** Market/outcome title, or a shortened token id if the title wasn't available. */
+  market: string;
+  traderPrice: number;
+  traderSize: number;
+  traderUsdc: number;
+  status: "copied" | "skipped" | "dryrun" | "error";
+  reason?: string;
+  ourOrder?: string;
+}
+
 export interface State {
   lastSeen: Record<string, number>;
   seenTrades: Record<string, number>;
@@ -24,6 +39,8 @@ export interface State {
   };
   redeemAttempts: Record<string, number>;
   stats: Stats;
+  /** Most recent trades, newest first — capped at MAX_TRADE_LOG entries. Powers the Telegram "логи" reply. */
+  tradeLog: TradeLogEntry[];
   /** Telegram getUpdates offset, so we don't re-process old messages after a restart. */
   telegramUpdateOffset: number;
 }
@@ -48,6 +65,7 @@ const defaultState = (): State => ({
   },
   redeemAttempts: {},
   stats: defaultStats(),
+  tradeLog: [],
   telegramUpdateOffset: 0,
 });
 
@@ -70,6 +88,7 @@ export const loadState = async (filePath: string): Promise<State> => {
       dailyVolume: parsed.dailyVolume ?? { day: "", spentUsd: 0 },
       redeemAttempts: parsed.redeemAttempts ?? {},
       stats: parsed.stats ?? defaultStats(),
+      tradeLog: parsed.tradeLog ?? [],
       telegramUpdateOffset: parsed.telegramUpdateOffset ?? 0,
     };
   } catch (err: unknown) {
@@ -131,4 +150,20 @@ export const recordTradeStat = (
 
 export const resetStats = (state: State): void => {
   state.stats = defaultStats();
+};
+
+/** Keeps the trade log from growing forever — only the most recent trades matter for "логи". */
+const MAX_TRADE_LOG = 40;
+
+/**
+ * Records one detected trade's full detail (market, prices, status, reason)
+ * for the Telegram "логи" reply — separate from `recordTradeStat`'s
+ * aggregate counters, this keeps the actual per-trade history so a specific
+ * trade can be looked up without digging through Railway logs.
+ */
+export const recordTradeLogEntry = (state: State, entry: TradeLogEntry): void => {
+  state.tradeLog.unshift(entry);
+  if (state.tradeLog.length > MAX_TRADE_LOG) {
+    state.tradeLog.length = MAX_TRADE_LOG;
+  }
 };
