@@ -3,6 +3,8 @@ import { Logger } from "./logger.js";
 import { State, resetStats } from "./state.js";
 import { TelegramNotifier } from "./telegram.js";
 import { sleep } from "./utils.js";
+import { STATUS_META, NotifyStatus, formatPrice, truncate } from "./copyTrader.js";
+import { formatUsd } from "./utils.js";
 
 interface TelegramUpdate {
   update_id: number;
@@ -58,6 +60,43 @@ export const formatStatsMessage = (state: State, config: Config): string => {
     "Команда /reset_stats обнулит эту статистику.",
   ].filter((line): line is string => line !== undefined);
   return lines.join("\n");
+};
+
+/**
+ * Builds the human-readable per-trade log sent back to Telegram when the
+ * message contains "логи"/"logs" — shows the most recent trades with full
+ * detail (market, trader's price/size, what the bot did, status, reason),
+ * so a specific trade can be looked up without digging through Railway logs.
+ */
+export const formatLogsMessage = (state: State, limit = 15): string => {
+  const entries = state.tradeLog.slice(0, limit);
+
+  if (entries.length === 0) {
+    return "🧾 Пока нет ни одной записи в логе сделок.";
+  }
+
+  const lines: string[] = [
+    `🧾 <b>Последние ${entries.length} сделок</b>`,
+    "",
+  ];
+
+  for (const entry of entries) {
+    const meta = STATUS_META[entry.status as NotifyStatus] ?? { emoji: "•", label: entry.status };
+    const when = entry.ts.slice(0, 16).replace("T", " ");
+
+    lines.push(`${meta.emoji} <b>${meta.label}</b> · ${entry.side}`);
+    lines.push(truncate(entry.market, 70));
+    lines.push(
+      `Трейдер: ${formatPrice(entry.traderPrice)} · ${entry.traderSize} шт (~$${formatUsd(entry.traderUsdc)})`,
+    );
+    if (entry.ourOrder) lines.push(`Твой ордер: ${entry.ourOrder}`);
+    if (entry.reason) lines.push(`Причина: ${truncate(entry.reason, 140)}`);
+    lines.push(`${when} UTC`);
+    lines.push("");
+  }
+
+  lines.push(`Показаны последние ${entries.length} из ${state.tradeLog.length} записей в памяти.`);
+  return lines.join("\n").trimEnd();
 };
 
 export interface TelegramCommandListenerOptions {
@@ -136,6 +175,10 @@ export class TelegramCommandListener {
         if (text === "/reset_stats") {
           resetStats(state);
           await this.opts.notifier.send("🔄 Статистика сброшена, отсчёт начат заново.");
+        } else if (/логи|logs/i.test(text)) {
+          // Telegram messages are capped at ~4096 chars — 15 entries fits
+          // comfortably with room to spare, so no pagination needed.
+          await this.opts.notifier.send(formatLogsMessage(state));
         } else {
           // Any other message (command or plain text) -> reply with the summary.
           await this.opts.notifier.send(formatStatsMessage(state, this.opts.config));
