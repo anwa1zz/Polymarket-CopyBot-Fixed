@@ -200,7 +200,7 @@ export const loadConfig = (): Config => {
   const maxPositionSizeUsd = parseNumber("MAX_POSITION_SIZE_USD");
 
   const copySide = normalizeSide(getEnv("COPY_SIDE"));
-  const maxSlippagePct = parseNumber("MAX_SLIPPAGE_PCT", 3);
+  const maxSlippagePct = parseNumber("MAX_SLIPPAGE_PCT", 0.5);
   const orderMode = normalizeOrderMode(getEnv("ORDER_MODE"));
   const limitOffsetPct = parseNumber("LIMIT_OFFSET_PCT", 2);
   const pollIntervalMs = parseNumber("POLL_INTERVAL_MS", 5000);
