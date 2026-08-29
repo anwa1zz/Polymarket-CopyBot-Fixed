@@ -1,6 +1,7 @@
 /**
- * Модуль 4 + 6: детектор обвала -> исполнение ордеров -> риск-лимиты.
- * DRY_RUN управляется через переменную окружения — по умолчанию true (безопасно).
+ * Детектор обвала YES -> покупка NO -> risk-лимиты.
+ * Следим ТОЛЬКО за YES-токенами (NO нам для детекции не нужен — раньше это
+ * путало логи, показывая "YES упал", даже если на самом деле падал NO).
  */
 
 import "dotenv/config";
@@ -16,12 +17,10 @@ const TRADE_SIZE_USD = Number(process.env.CRASH_TRADE_SIZE_USD ?? "5");
 const MAX_SLIPPAGE_PCT = Number(process.env.CRASH_MAX_SLIPPAGE_PCT ?? "1");
 const MAX_MARKET_EXPOSURE_USD = Number(process.env.CRASH_MAX_MARKET_EXPOSURE_USD ?? "15");
 const MAX_DAILY_TOTAL_USD = Number(process.env.CRASH_MAX_DAILY_TOTAL_USD ?? "100");
-// ^ общий потолок на ВСЕ сделки за календарные сутки (UTC), не только на один рынок
 
 interface TokenInfo {
-  tokenId: string;
-  side: "YES" | "NO";
-  pairTokenId: string;
+  yesTokenId: string;
+  noTokenId: string;
   city: string;
   binLabel: string;
   eventSlug: string;
@@ -31,15 +30,21 @@ function buildTokenIndex(markets: WeatherMarket[]): Map<string, TokenInfo> {
   const index = new Map<string, TokenInfo>();
   for (const m of markets) {
     for (const b of m.bins) {
-      index.set(b.yesTokenId, { tokenId: b.yesTokenId, side: "YES", pairTokenId: b.noTokenId, city: m.city, binLabel: b.label, eventSlug: m.eventSlug });
-      index.set(b.noTokenId, { tokenId: b.noTokenId, side: "NO", pairTokenId: b.yesTokenId, city: m.city, binLabel: b.label, eventSlug: m.eventSlug });
+      // ключ — только YES-токен, потому что только его мы слушаем
+      index.set(b.yesTokenId, {
+        yesTokenId: b.yesTokenId,
+        noTokenId: b.noTokenId,
+        city: m.city,
+        binLabel: b.label,
+        eventSlug: m.eventSlug,
+      });
     }
   }
   return index;
 }
 
 function todayUtcKey(): string {
-  return new Date().toISOString().slice(0, 10); // "2026-08-29"
+  return new Date().toISOString().slice(0, 10);
 }
 
 class RiskManager {
@@ -50,7 +55,7 @@ class RiskManager {
   private rolloverIfNewDay(): void {
     const key = todayUtcKey();
     if (key !== this.dailyKey) {
-      console.log(`📅 Новые сутки (${key}) — дневной лимит и лимиты по рынкам сброшены.`);
+      console.log(`📅 Новые сутки (${key}) — лимиты сброшены.`);
       this.dailyKey = key;
       this.dailySpent = 0;
       this.marketSpent.clear();
@@ -59,13 +64,12 @@ class RiskManager {
 
   canSpend(eventSlug: string, amountUsd: number): { ok: boolean; reason?: string } {
     this.rolloverIfNewDay();
-
     if (this.dailySpent + amountUsd > MAX_DAILY_TOTAL_USD) {
-      return { ok: false, reason: `превышен общий дневной лимит (${MAX_DAILY_TOTAL_USD}$), уже потрачено ${this.dailySpent}$` };
+      return { ok: false, reason: `дневной лимит (${MAX_DAILY_TOTAL_USD}$), потрачено ${this.dailySpent}$` };
     }
     const marketCurrent = this.marketSpent.get(eventSlug) ?? 0;
     if (marketCurrent + amountUsd > MAX_MARKET_EXPOSURE_USD) {
-      return { ok: false, reason: `превышен лимит на этот рынок (${MAX_MARKET_EXPOSURE_USD}$)` };
+      return { ok: false, reason: `лимит на рынок (${MAX_MARKET_EXPOSURE_USD}$)` };
     }
     return { ok: true };
   }
@@ -81,13 +85,8 @@ class RiskManager {
   }
 }
 
-async function handleSignal(
-  signal: CrashSignal,
-  info: TokenInfo,
-  clob: ClobService | null,
-  risk: RiskManager,
-) {
-  const buyTokenId = info.pairTokenId;
+async function handleSignal(signal: CrashSignal, info: TokenInfo, clob: ClobService | null, risk: RiskManager) {
+  const buyTokenId = info.noTokenId; // покупаем NO — YES обвалился, бин исключается
 
   console.log(`\n=== СИГНАЛ: ${info.city} / ${info.binLabel} (${info.eventSlug}) ===`);
   console.log(`YES упал с ${signal.priceBefore} до ${signal.priceNow} за ${signal.windowSec.toFixed(1)}с`);
@@ -137,11 +136,12 @@ async function main() {
   console.log(`Режим: ${DRY_RUN ? "DRY_RUN (без реальных сделок)" : "⚠️  LIVE — РЕАЛЬНЫЕ ДЕНЬГИ"}`);
   console.log(`Лимиты: ${TRADE_SIZE_USD}$/сделка, ${MAX_MARKET_EXPOSURE_USD}$/рынок/день, ${MAX_DAILY_TOTAL_USD}$/всего/день`);
 
-  console.log("Загружаем список рынков...");
+  console.log("Загружаем список рынков (только highest, только сегодня)...");
   const markets = await discoverWeatherMarkets();
   const tokenIndex = buildTokenIndex(markets);
-  const allTokenIds = [...tokenIndex.keys()];
-  console.log(`Мониторим ${markets.length} рынков, ${allTokenIds.length} токенов`);
+  const yesTokenIds = [...tokenIndex.keys()];
+  console.log(`Мониторим ${markets.length} рынков, ${yesTokenIds.length} YES-токенов`);
+  console.log("Города:", markets.map((m) => m.city).join(", "));
 
   let clob: ClobService | null = null;
   if (!DRY_RUN) {
@@ -163,7 +163,7 @@ async function main() {
   const detector = new CrashDetector();
   const risk = new RiskManager();
 
-  const watcher = new PriceWatcher(allTokenIds, async (update: PriceUpdate) => {
+  const watcher = new PriceWatcher(yesTokenIds, async (update: PriceUpdate) => {
     const signal = detector.onPriceUpdate(update);
     if (!signal) return;
     const info = tokenIndex.get(signal.tokenId);

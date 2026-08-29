@@ -1,10 +1,10 @@
 /**
  * Модуль 1: поиск активных погодных рынков на Polymarket через Gamma API.
- * Ничего не покупает, только находит рынки и их токены.
+ * Только "highest temperature", только рынки на СЕГОДНЯ (по UTC-дате).
  */
 
 export interface WeatherBin {
-  label: string;       // например "23C" или "94-95F"
+  label: string;
   lowValue: number;
   highValue: number;
   yesTokenId: string;
@@ -15,32 +15,27 @@ export interface WeatherMarket {
   city: string;
   eventSlug: string;
   metric: "high" | "low";
-  targetDate: string;  // YYYY-MM-DD
+  targetDate: string;
   bins: WeatherBin[];
 }
 
 const GAMMA_HOST = "https://gamma-api.polymarket.com";
 
 function parseBinFromTitle(title: string): { low: number; high: number } | null {
-  // Диапазон вида "94-95°F" — ищем где угодно в тексте (не только сразу после "be")
   const range = title.match(/(-?\d+)\s*-\s*(-?\d+)\s*°?\s*[CF]/i);
   if (range) return { low: Number(range[1]), high: Number(range[2]) };
 
-  // "22°C or below"
   const orBelow = title.match(/(-?\d+)\s*°?\s*[CF]?\s*or below/i);
   if (orBelow) return { low: -1000, high: Number(orBelow[1]) };
 
-  // "35°C or higher" / "82°F or above"
   const orAbove = title.match(/(-?\d+)\s*°?\s*[CF]?\s*or (higher|above)/i);
   if (orAbove) return { low: Number(orAbove[1]), high: 1000 };
 
-  // Одиночное значение "be 23°C on ..."
   const single = title.match(/be (?:exactly )?(-?\d+)\s*°?\s*[CF]?(?:\s+on\s|\?|$)/i);
   if (single) {
     const v = Number(single[1]);
     return { low: v, high: v };
   }
-
   return null;
 }
 
@@ -55,7 +50,7 @@ export async function fetchActiveWeatherEvents(limit = 100): Promise<any[]> {
     events.push(...batch);
     if (batch.length < limit) break;
     offset += limit;
-    if (offset > 2000) break; // защита от бесконечного цикла
+    if (offset > 2000) break;
   }
   return events;
 }
@@ -63,13 +58,13 @@ export async function fetchActiveWeatherEvents(limit = 100): Promise<any[]> {
 export function parseWeatherEvent(event: any): WeatherMarket | null {
   const title: string = event.title ?? "";
   const isHigh = /highest temperature/i.test(title);
-  const isLow = /lowest temperature/i.test(title);
-  if (!isHigh && !isLow) return null;
+  // Только highest — lowest сознательно отключён по твоему решению
+  if (!isHigh) return null;
 
   const cityMatch = title.match(/temperature in ([A-Za-z\s]+?) (be|on)/i) ||
                      title.match(/temperature in ([A-Za-z\s]+?)\?/i);
   const city = cityMatch ? cityMatch[1].trim() : null;
-if (!city) return null; // пропускаем не-городские спецрынки (Burning Man и т.п.)
+  if (!city) return null;
 
   const bins: WeatherBin[] = [];
   for (const m of event.markets ?? []) {
@@ -95,7 +90,7 @@ if (!city) return null; // пропускаем не-городские спец
   return {
     city,
     eventSlug: event.slug,
-    metric: isHigh ? "high" : "low",
+    metric: "high",
     targetDate: event.eventDate ?? "",
     bins,
   };
@@ -103,21 +98,27 @@ if (!city) return null; // пропускаем не-городские спец
 
 export async function discoverWeatherMarkets(): Promise<WeatherMarket[]> {
   const events = await fetchActiveWeatherEvents();
+  const todayUtc = new Date().toISOString().slice(0, 10); // например "2026-08-29"
+
   const markets: WeatherMarket[] = [];
   for (const ev of events) {
     const parsed = parseWeatherEvent(ev);
-    if (parsed) markets.push(parsed);
+    if (!parsed) continue;
+
+    // Только сегодняшняя дата (по UTC — см. пояснение в чате про краевой случай
+    // на границе суток для городов далеко на востоке)
+    if (parsed.targetDate !== todayUtc) continue;
+
+    markets.push(parsed);
   }
   return markets;
 }
 
-// Можно запустить этот файл напрямую для проверки: npx tsx src/marketDiscovery.ts
 if (import.meta.url === `file://${process.argv[1]}`) {
   discoverWeatherMarkets().then((markets) => {
-    console.log(`Найдено рынков: ${markets.length}`);
+    console.log(`Найдено рынков на сегодня (только highest): ${markets.length}`);
     console.log(`Всего бинов: ${markets.reduce((s, m) => s + m.bins.length, 0)}`);
-    console.log("Пример первых трёх рынков:");
-    console.log(JSON.stringify(markets.slice(0, 3), null, 2));
+    console.log("Города:", markets.map((m) => m.city).join(", "));
   }).catch((err) => {
     console.error("Ошибка:", err);
     process.exit(1);
