@@ -16,10 +16,13 @@
     "@polymarket/clob-client-v2": "^1.1.0",
     "dotenv": "^17.2.3",
     "ethers": "^5.8.0",
-    "viem": "^2.55.19"
+    "viem": "^2.55.19",
+    "ws": "^8.21.3"
   },
   "devDependencies": {
     "@types/node": "^20.11.30",
+    "@types/ws": "^8.18.1",
+    "tsx": "^4.23.12",
     "typescript": "^5.9.3"
   },
   "engines": {
