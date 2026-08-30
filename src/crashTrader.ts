@@ -1,5 +1,6 @@
 /**
- * Детектор обвала YES -> покупка NO -> risk-лимиты -> уведомления в Telegram.
+ * Детектор обвала YES -> подтверждение живой цены NO -> покупка -> risk-лимиты -> Telegram.
+ * + асинхронный сбор данных NWS-метеостанций (только для статистики, не блокирует сделку).
  */
 
 import "dotenv/config";
@@ -17,12 +18,53 @@ const MAX_SLIPPAGE_PCT = Number(process.env.CRASH_MAX_SLIPPAGE_PCT ?? "1");
 const MAX_MARKET_EXPOSURE_USD = Number(process.env.CRASH_MAX_MARKET_EXPOSURE_USD ?? "15");
 const MAX_DAILY_TOTAL_USD = Number(process.env.CRASH_MAX_DAILY_TOTAL_USD ?? "100");
 
+// Не покупаем NO, пока его живая цена не достигнет этого уровня
+const MIN_NO_ENTRY_PRICE = Number(process.env.CRASH_MIN_NO_ENTRY_PRICE ?? "0.98");
+// Сколько ждём (секунд), пока NO дорастёт до порога, прежде чем сдаться
+const NO_CONFIRM_TIMEOUT_SEC = Number(process.env.CRASH_NO_CONFIRM_TIMEOUT_SEC ?? "15");
+// Как часто проверяем цену NO в это окно ожидания
+const NO_CONFIRM_POLL_MS = 1000;
+
 interface TokenInfo {
   yesTokenId: string;
   noTokenId: string;
   city: string;
   binLabel: string;
   eventSlug: string;
+}
+
+// Известные NWS-станции по городам (частично — расширяем по мере надобности).
+// Используется ТОЛЬКО для справочного лога, ни на что в решении о покупке не влияет.
+const CITY_STATIONS: Record<string, string> = {
+  "New York City": "KNYC",
+  "Chicago": "KORD",
+  "Miami": "KMIA",
+  "Los Angeles": "KLAX",
+  "Denver": "KDEN",
+  "Dallas": "KDAL",
+  "Houston": "KHOU",
+  "Atlanta": "KATL",
+  "Seattle": "KSEA",
+  "San Francisco": "KSFO",
+  "Austin": "KAUS",
+};
+
+async function fetchStationContext(city: string): Promise<string | null> {
+  const station = CITY_STATIONS[city];
+  if (!station) return null;
+  try {
+    const resp = await fetch(`https://api.weather.gov/stations/${station}/observations/latest`, {
+      headers: { "User-Agent": "polybot/0.1 (research)" },
+    });
+    if (!resp.ok) return null;
+    const data = (await resp.json()) as any;
+    const tempC = data?.properties?.temperature?.value;
+    if (tempC === null || tempC === undefined) return null;
+    const tempF = (tempC * 9) / 5 + 32;
+    return `NWS ${station}: ${tempC.toFixed(1)}°C / ${tempF.toFixed(1)}°F (справочно, не влияет на решение)`;
+  } catch {
+    return null;
+  }
 }
 
 function buildTokenIndex(markets: WeatherMarket[]): Map<string, TokenInfo> {
@@ -39,6 +81,37 @@ function buildTokenIndex(markets: WeatherMarket[]): Map<string, TokenInfo> {
     }
   }
   return index;
+}
+
+// Живая цена NO через публичный REST-эндпоинт стакана — работает без авторизации,
+// поэтому доступна и в DRY_RUN, и в LIVE одинаково.
+async function getLiveBestAsk(tokenId: string): Promise<number | null> {
+  try {
+    const resp = await fetch(`https://clob.polymarket.com/book?token_id=${tokenId}`);
+    if (!resp.ok) return null;
+    const data = (await resp.json()) as any;
+    const asks = (data.asks ?? []).map((a: any) => Number(a.price)).filter((p: number) => Number.isFinite(p));
+    return asks.length ? Math.min(...asks) : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Ждём, пока живая цена NO реально достигнет MIN_NO_ENTRY_PRICE, прежде чем покупать.
+ * Если NO уже там (как в примере с Панамой) — вернётся почти мгновенно.
+ * Если NO медленно сползает (как Буэнос-Айрес) и не успевает за отведённое время — вернёт null (пропуск).
+ */
+async function waitForNoConfirmation(noTokenId: string): Promise<number | null> {
+  const deadline = Date.now() + NO_CONFIRM_TIMEOUT_SEC * 1000;
+  while (Date.now() < deadline) {
+    const price = await getLiveBestAsk(noTokenId);
+    if (price !== null && price >= MIN_NO_ENTRY_PRICE) {
+      return price;
+    }
+    await new Promise((r) => setTimeout(r, NO_CONFIRM_POLL_MS));
+  }
+  return null;
 }
 
 function todayUtcKey(): string {
@@ -83,28 +156,30 @@ class RiskManager {
   }
 }
 
-// Простая статистика для часовой сводки в Telegram
 class StatsTracker {
-  private signals: { city: string; bin: string; time: number }[] = [];
+  private signals: { city: string; bin: string }[] = [];
   private skipped = 0;
+  private notConfirmed = 0;
 
   recordSignal(city: string, bin: string): void {
-    this.signals.push({ city, bin, time: Date.now() });
+    this.signals.push({ city, bin });
   }
-
   recordSkip(): void {
     this.skipped++;
+  }
+  recordNotConfirmed(): void {
+    this.notConfirmed++;
   }
 
   buildHourlySummary(): string {
     const count = this.signals.length;
-    const lines = this.signals
-      .slice(-15) // последние 15, чтобы сообщение не было гигантским
-      .map((s) => `• ${s.city} / ${s.bin}`)
-      .join("\n");
-    const summary = `📊 <b>Сводка за час</b>\nСигналов: ${count}\nПропущено (лимиты): ${this.skipped}\n\n${lines || "(сигналов не было)"}`;
+    const lines = this.signals.slice(-15).map((s) => `• ${s.city} / ${s.bin}`).join("\n");
+    const summary =
+      `📊 <b>Сводка за час</b>\nСигналов всего: ${count}\n` +
+      `Пропущено (лимиты): ${this.skipped}\nНе подтвердились (NO не дорос до ${MIN_NO_ENTRY_PRICE}): ${this.notConfirmed}\n\n${lines || "(сигналов не было)"}`;
     this.signals = [];
     this.skipped = 0;
+    this.notConfirmed = 0;
     return summary;
   }
 }
@@ -117,12 +192,25 @@ async function handleSignal(
   telegram: TelegramNotifier | undefined,
   stats: StatsTracker,
 ) {
-  const buyTokenId = info.noTokenId;
-
   console.log(`\n=== СИГНАЛ: ${info.city} / ${info.binLabel} (${info.eventSlug}) ===`);
   console.log(`YES упал с ${signal.priceBefore} до ${signal.priceNow} за ${signal.windowSec.toFixed(1)}с`);
-
   stats.recordSignal(info.city, info.binLabel);
+
+  // Справочный контекст от метеостанции — не блокирует, просто логируем/шлём параллельно
+  fetchStationContext(info.city).then((ctx) => {
+    if (ctx) console.log(`  ℹ️  ${ctx}`);
+  });
+
+  console.log(`Ждём подтверждения: NO должен дорасти до ${MIN_NO_ENTRY_PRICE} (максимум ${NO_CONFIRM_TIMEOUT_SEC}с)...`);
+  const confirmedPrice = await waitForNoConfirmation(info.noTokenId);
+
+  if (confirmedPrice === null) {
+    console.log(`⏭️  ПРОПУСК: NO не дорос до ${MIN_NO_ENTRY_PRICE} за ${NO_CONFIRM_TIMEOUT_SEC}с — слишком рано / слишком рискованно`);
+    stats.recordNotConfirmed();
+    return;
+  }
+
+  console.log(`✅ NO подтверждён на ${confirmedPrice}`);
 
   const check = risk.canSpend(info.eventSlug, TRADE_SIZE_USD);
   if (!check.ok) {
@@ -134,7 +222,7 @@ async function handleSignal(
   console.log(`Действие: покупаем NO на ${TRADE_SIZE_USD}$ | ${risk.status()}`);
 
   const modeTag = DRY_RUN ? "[DRY_RUN] " : "";
-  const msg = `${modeTag}🚨 <b>${info.city} / ${info.binLabel}</b>\nYES: ${signal.priceBefore} → ${signal.priceNow} за ${signal.windowSec.toFixed(1)}с\nПокупаем NO на ${TRADE_SIZE_USD}$`;
+  const msg = `${modeTag}🚨 <b>${info.city} / ${info.binLabel}</b>\nYES: ${signal.priceBefore} → ${signal.priceNow} за ${signal.windowSec.toFixed(1)}с\nNO подтверждён на ${confirmedPrice}\nПокупаем на ${TRADE_SIZE_USD}$`;
   await telegram?.send(msg);
 
   if (DRY_RUN || !clob) {
@@ -145,9 +233,9 @@ async function handleSignal(
 
   try {
     const buyResp = await clob.placeLimitOrder({
-      tokenId: buyTokenId,
+      tokenId: info.noTokenId,
       side: Side.BUY,
-      price: signal.priceNow,
+      price: confirmedPrice,
       size: TRADE_SIZE_USD,
       maxSlippagePct: MAX_SLIPPAGE_PCT,
     });
@@ -158,7 +246,7 @@ async function handleSignal(
     const filledShares = Number(buyResp.filledSize ?? 0);
     if (filledShares > 0) {
       const sellResp = await clob.placeGtcLimitOrder({
-        tokenId: buyTokenId,
+        tokenId: info.noTokenId,
         side: Side.SELL,
         price: 0.999,
         size: filledShares,
@@ -176,6 +264,7 @@ async function handleSignal(
 async function main() {
   console.log(`Режим: ${DRY_RUN ? "DRY_RUN (без реальных сделок)" : "⚠️  LIVE — РЕАЛЬНЫЕ ДЕНЬГИ"}`);
   console.log(`Лимиты: ${TRADE_SIZE_USD}$/сделка, ${MAX_MARKET_EXPOSURE_USD}$/рынок/день, ${MAX_DAILY_TOTAL_USD}$/всего/день`);
+  console.log(`Порог входа NO: ${MIN_NO_ENTRY_PRICE}, таймаут подтверждения: ${NO_CONFIRM_TIMEOUT_SEC}с`);
 
   const logger: Logger = createLogger(false);
   const telegram = createTelegramNotifier(process.env.TELEGRAM_BOT_TOKEN, process.env.TELEGRAM_CHAT_ID, logger);
@@ -183,7 +272,7 @@ async function main() {
     console.log("Telegram уведомления включены.");
     await telegram.send(`🤖 Бот запущен. Режим: ${DRY_RUN ? "DRY_RUN" : "LIVE"}`);
   } else {
-    console.log("Telegram НЕ настроен (нет TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID) — уведомлений не будет.");
+    console.log("Telegram НЕ настроен — уведомлений не будет.");
   }
 
   console.log("Загружаем список рынков (только highest, только сегодня)...");
@@ -223,7 +312,6 @@ async function main() {
 
   watcher.start();
 
-  // Часовая сводка в Telegram
   setInterval(async () => {
     if (!telegram) return;
     await telegram.send(stats.buildHourlySummary());
