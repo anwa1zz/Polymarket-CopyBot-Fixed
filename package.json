@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "start": "npx tsx src/crashTrader.ts",
+    "start": "npx tsx src/statsCollector.ts",
     "dev": "tsc -w",
     "lint": "tsc -p tsconfig.json --noEmit"
   },
