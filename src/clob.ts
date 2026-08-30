@@ -409,4 +409,11 @@ export class ClobService {
       filledUsdc: respAny.takingAmount,
     };
   }
+  async getOrder(orderId: string) {
+    return this.client.getOrder(orderId);
+  }
+
+  async cancelOrders(orderIds: string[]) {
+    return this.client.cancelOrders(orderIds);
+  }
 }

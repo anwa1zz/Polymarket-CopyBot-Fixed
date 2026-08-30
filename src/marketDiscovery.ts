@@ -1,6 +1,8 @@
 /**
  * Модуль 1: поиск активных погодных рынков на Polymarket через Gamma API.
  * Только "highest temperature", только рынки на СЕГОДНЯ (по UTC-дате).
+ * Плюс сохраняем resolutionSource — точную ссылку на станцию, которую
+ * реально использует резолвер Polymarket (weather.gov или wunderground).
  */
 
 export interface WeatherBin {
@@ -16,6 +18,7 @@ export interface WeatherMarket {
   eventSlug: string;
   metric: "high" | "low";
   targetDate: string;
+  resolutionSource: string;
   bins: WeatherBin[];
 }
 
@@ -58,7 +61,6 @@ export async function fetchActiveWeatherEvents(limit = 100): Promise<any[]> {
 export function parseWeatherEvent(event: any): WeatherMarket | null {
   const title: string = event.title ?? "";
   const isHigh = /highest temperature/i.test(title);
-  // Только highest — lowest сознательно отключён по твоему решению
   if (!isHigh) return null;
 
   const cityMatch = title.match(/temperature in ([A-Za-z\s]+?) (be|on)/i) ||
@@ -92,23 +94,20 @@ export function parseWeatherEvent(event: any): WeatherMarket | null {
     eventSlug: event.slug,
     metric: "high",
     targetDate: event.eventDate ?? "",
+    resolutionSource: event.resolutionSource ?? "",
     bins,
   };
 }
 
 export async function discoverWeatherMarkets(): Promise<WeatherMarket[]> {
   const events = await fetchActiveWeatherEvents();
-  const todayUtc = new Date().toISOString().slice(0, 10); // например "2026-08-29"
+  const todayUtc = new Date().toISOString().slice(0, 10);
 
   const markets: WeatherMarket[] = [];
   for (const ev of events) {
     const parsed = parseWeatherEvent(ev);
     if (!parsed) continue;
-
-    // Только сегодняшняя дата (по UTC — см. пояснение в чате про краевой случай
-    // на границе суток для городов далеко на востоке)
     if (parsed.targetDate !== todayUtc) continue;
-
     markets.push(parsed);
   }
   return markets;
@@ -119,6 +118,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     console.log(`Найдено рынков на сегодня (только highest): ${markets.length}`);
     console.log(`Всего бинов: ${markets.reduce((s, m) => s + m.bins.length, 0)}`);
     console.log("Города:", markets.map((m) => m.city).join(", "));
+    console.log("Пример resolutionSource:", markets.slice(0, 3).map((m) => `${m.city}: ${m.resolutionSource}`));
   }).catch((err) => {
     console.error("Ошибка:", err);
     process.exit(1);

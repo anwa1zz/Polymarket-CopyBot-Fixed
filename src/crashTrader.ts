@@ -1,6 +1,7 @@
 /**
- * Детектор обвала YES -> подтверждение живой цены NO -> покупка -> risk-лимиты -> Telegram.
- * + асинхронный сбор данных NWS-метеостанций (только для статистики, не блокирует сделку).
+ * Полная цепочка: детектор обвала YES -> подтверждение живой цены NO ->
+ * покупка -> Exit Manager следит за выходом -> risk-лимиты -> Telegram +
+ * справочный контекст с реальной метеостанции резолвера.
  */
 
 import "dotenv/config";
@@ -11,18 +12,16 @@ import { CrashDetector, CrashSignal } from "./crashDetector.js";
 import { ClobService } from "./clob.js";
 import { createLogger, Logger } from "./logger.js";
 import { createTelegramNotifier, TelegramNotifier } from "./telegram.js";
+import { fetchWeatherContext } from "./weatherContext.js";
+import { ExitManager } from "./exitManager.js";
 
 const DRY_RUN = (process.env.CRASH_DRY_RUN ?? "true").toLowerCase() !== "false";
 const TRADE_SIZE_USD = Number(process.env.CRASH_TRADE_SIZE_USD ?? "5");
 const MAX_SLIPPAGE_PCT = Number(process.env.CRASH_MAX_SLIPPAGE_PCT ?? "1");
 const MAX_MARKET_EXPOSURE_USD = Number(process.env.CRASH_MAX_MARKET_EXPOSURE_USD ?? "15");
 const MAX_DAILY_TOTAL_USD = Number(process.env.CRASH_MAX_DAILY_TOTAL_USD ?? "100");
-
-// Не покупаем NO, пока его живая цена не достигнет этого уровня
 const MIN_NO_ENTRY_PRICE = Number(process.env.CRASH_MIN_NO_ENTRY_PRICE ?? "0.98");
-// Сколько ждём (секунд), пока NO дорастёт до порога, прежде чем сдаться
 const NO_CONFIRM_TIMEOUT_SEC = Number(process.env.CRASH_NO_CONFIRM_TIMEOUT_SEC ?? "15");
-// Как часто проверяем цену NO в это окно ожидания
 const NO_CONFIRM_POLL_MS = 1000;
 
 interface TokenInfo {
@@ -31,40 +30,7 @@ interface TokenInfo {
   city: string;
   binLabel: string;
   eventSlug: string;
-}
-
-// Известные NWS-станции по городам (частично — расширяем по мере надобности).
-// Используется ТОЛЬКО для справочного лога, ни на что в решении о покупке не влияет.
-const CITY_STATIONS: Record<string, string> = {
-  "New York City": "KNYC",
-  "Chicago": "KORD",
-  "Miami": "KMIA",
-  "Los Angeles": "KLAX",
-  "Denver": "KDEN",
-  "Dallas": "KDAL",
-  "Houston": "KHOU",
-  "Atlanta": "KATL",
-  "Seattle": "KSEA",
-  "San Francisco": "KSFO",
-  "Austin": "KAUS",
-};
-
-async function fetchStationContext(city: string): Promise<string | null> {
-  const station = CITY_STATIONS[city];
-  if (!station) return null;
-  try {
-    const resp = await fetch(`https://api.weather.gov/stations/${station}/observations/latest`, {
-      headers: { "User-Agent": "polybot/0.1 (research)" },
-    });
-    if (!resp.ok) return null;
-    const data = (await resp.json()) as any;
-    const tempC = data?.properties?.temperature?.value;
-    if (tempC === null || tempC === undefined) return null;
-    const tempF = (tempC * 9) / 5 + 32;
-    return `NWS ${station}: ${tempC.toFixed(1)}°C / ${tempF.toFixed(1)}°F (справочно, не влияет на решение)`;
-  } catch {
-    return null;
-  }
+  resolutionSource: string;
 }
 
 function buildTokenIndex(markets: WeatherMarket[]): Map<string, TokenInfo> {
@@ -77,14 +43,13 @@ function buildTokenIndex(markets: WeatherMarket[]): Map<string, TokenInfo> {
         city: m.city,
         binLabel: b.label,
         eventSlug: m.eventSlug,
+        resolutionSource: m.resolutionSource,
       });
     }
   }
   return index;
 }
 
-// Живая цена NO через публичный REST-эндпоинт стакана — работает без авторизации,
-// поэтому доступна и в DRY_RUN, и в LIVE одинаково.
 async function getLiveBestAsk(tokenId: string): Promise<number | null> {
   try {
     const resp = await fetch(`https://clob.polymarket.com/book?token_id=${tokenId}`);
@@ -97,18 +62,11 @@ async function getLiveBestAsk(tokenId: string): Promise<number | null> {
   }
 }
 
-/**
- * Ждём, пока живая цена NO реально достигнет MIN_NO_ENTRY_PRICE, прежде чем покупать.
- * Если NO уже там (как в примере с Панамой) — вернётся почти мгновенно.
- * Если NO медленно сползает (как Буэнос-Айрес) и не успевает за отведённое время — вернёт null (пропуск).
- */
 async function waitForNoConfirmation(noTokenId: string): Promise<number | null> {
   const deadline = Date.now() + NO_CONFIRM_TIMEOUT_SEC * 1000;
   while (Date.now() < deadline) {
     const price = await getLiveBestAsk(noTokenId);
-    if (price !== null && price >= MIN_NO_ENTRY_PRICE) {
-      return price;
-    }
+    if (price !== null && price >= MIN_NO_ENTRY_PRICE) return price;
     await new Promise((r) => setTimeout(r, NO_CONFIRM_POLL_MS));
   }
   return null;
@@ -191,13 +149,13 @@ async function handleSignal(
   risk: RiskManager,
   telegram: TelegramNotifier | undefined,
   stats: StatsTracker,
+  exitManager: ExitManager | null,
 ) {
   console.log(`\n=== СИГНАЛ: ${info.city} / ${info.binLabel} (${info.eventSlug}) ===`);
   console.log(`YES упал с ${signal.priceBefore} до ${signal.priceNow} за ${signal.windowSec.toFixed(1)}с`);
   stats.recordSignal(info.city, info.binLabel);
 
-  // Справочный контекст от метеостанции — не блокирует, просто логируем/шлём параллельно
-  fetchStationContext(info.city).then((ctx) => {
+  fetchWeatherContext(info.city, info.resolutionSource).then((ctx) => {
     if (ctx) console.log(`  ℹ️  ${ctx}`);
   });
 
@@ -205,11 +163,10 @@ async function handleSignal(
   const confirmedPrice = await waitForNoConfirmation(info.noTokenId);
 
   if (confirmedPrice === null) {
-    console.log(`⏭️  ПРОПУСК: NO не дорос до ${MIN_NO_ENTRY_PRICE} за ${NO_CONFIRM_TIMEOUT_SEC}с — слишком рано / слишком рискованно`);
+    console.log(`⏭️  ПРОПУСК: NO не дорос до ${MIN_NO_ENTRY_PRICE} за ${NO_CONFIRM_TIMEOUT_SEC}с`);
     stats.recordNotConfirmed();
     return;
   }
-
   console.log(`✅ NO подтверждён на ${confirmedPrice}`);
 
   const check = risk.canSpend(info.eventSlug, TRADE_SIZE_USD);
@@ -254,6 +211,17 @@ async function handleSignal(
       });
       console.log("✅ Выходная лимитка выставлена:", sellResp);
       await telegram?.send(`📤 Лимитка на выход 0.999 выставлена: ${info.city} / ${info.binLabel}`);
+
+      if (exitManager && sellResp.orderId) {
+        exitManager.watch({
+          orderId: sellResp.orderId,
+          tokenId: info.noTokenId,
+          city: info.city,
+          binLabel: info.binLabel,
+          originalSize: filledShares,
+          startedAt: Date.now(),
+        });
+      }
     }
   } catch (err) {
     console.error("❌ Ошибка исполнения:", (err as Error).message);
@@ -283,6 +251,7 @@ async function main() {
   console.log("Города:", markets.map((m) => m.city).join(", "));
 
   let clob: ClobService | null = null;
+  let exitManager: ExitManager | null = null;
   if (!DRY_RUN) {
     clob = await ClobService.init(
       {
@@ -296,6 +265,9 @@ async function main() {
       logger,
     );
     console.log("ClobService инициализирован для LIVE торговли.");
+    exitManager = new ExitManager(clob, telegram);
+    exitManager.start();
+    console.log("Exit Manager запущен.");
   }
 
   const detector = new CrashDetector();
@@ -307,7 +279,7 @@ async function main() {
     if (!signal) return;
     const info = tokenIndex.get(signal.tokenId);
     if (!info) return;
-    await handleSignal(signal, info, clob, risk, telegram, stats);
+    await handleSignal(signal, info, clob, risk, telegram, stats, exitManager);
   });
 
   watcher.start();
