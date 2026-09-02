@@ -11,7 +11,7 @@ import { PriceWatcher, PriceUpdate } from "./priceWatcher.js";
 import { createLogger } from "./logger.js";
 import { createTelegramNotifier, TelegramNotifier } from "./telegram.js";
 
-const THRESHOLDS = [0.95, 0.96, 0.97, 0.98, 0.99];
+const THRESHOLDS = [0.95, 0.96, 0.97, 0.98, 0.99, 0.995];
 const SUCCESS_PRICE = 0.995;
 const REVERSAL_PRICE = 0.02;
 const SUMMARY_INTERVAL_MS = 3 * 60 * 60 * 1000;
