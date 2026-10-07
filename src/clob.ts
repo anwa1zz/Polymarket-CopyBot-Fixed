@@ -29,10 +29,19 @@ export class ClobService {
   private client: ClobClient;
   private logger: Logger;
   private metaCache = new Map<string, { meta: MarketMeta; ts: number }>();
+  // Сохраняем креды, чтобы отдать их наружу для авторизации в userStream
+  // (реальный User Stream Polymarket для подтверждения сделок ончейн).
+  private creds: ApiKeyCreds;
 
-  private constructor(client: ClobClient, logger: Logger) {
+  private constructor(client: ClobClient, logger: Logger, creds: ApiKeyCreds) {
     this.client = client;
     this.logger = logger;
+    this.creds = creds;
+  }
+
+  /** Креды API, нужны для подключения к авторизованному User Stream. */
+  getApiCreds(): ApiKeyCreds {
+    return this.creds;
   }
 
   static async init(
@@ -80,7 +89,7 @@ export class ClobService {
       funderAddress: config.funderAddress,
     });
 
-    return new ClobService(client, logger);
+    return new ClobService(client, logger, creds);
   }
 
   async getMarketMeta(tokenId: string): Promise<MarketMeta> {
@@ -193,6 +202,9 @@ export class ClobService {
    * It's still a FAK (fill-and-kill) order: it fills as much as it can
    * immediately and kills the rest — nothing is left resting on the book,
    * so no funds get tied up waiting.
+   *
+   * Возвращает также orderId — нужен, чтобы затем дождаться финального
+   * ончейн-подтверждения через userStream.waitForConfirmation(orderId, ...).
    */
   async placeLimitOrder(params: {
     tokenId: string;
@@ -200,7 +212,7 @@ export class ClobService {
     price: number; // trader's execution price — used ONLY as a fallback if the live book is empty on that side
     size: number;
     maxSlippagePct?: number; // now used as the small buffer added past the live best ask/bid, default 0.5%
-  }): Promise<{ status: string; filledSize?: string; filledUsdc?: string }> {
+  }): Promise<{ status: string; filledSize?: string; filledUsdc?: string; orderId?: string | null }> {
     const { tokenId, side, size } = params;
 
     const book = await this.getTopOfBook(tokenId);
@@ -288,6 +300,7 @@ export class ClobService {
     const respAny = resp as unknown as {
       success?: boolean;
       status?: string | number;
+      orderID?: string;
       error?: string;
       errorMsg?: string;
       makingAmount?: string;
@@ -308,22 +321,14 @@ export class ClobService {
       status: String(respAny.status),
       filledSize: respAny.makingAmount,
       filledUsdc: respAny.takingAmount,
+      orderId: respAny.orderID ?? null,
     };
   }
 
   /**
-   * GTC (Good-Till-Cancelled) limit order — used when ORDER_MODE=LIMIT.
-   *
-   * Unlike the market FAK order above, this does NOT require immediate full
-   * liquidity: if only part fills right away, the rest just sits on the book
-   * as a resting order until it fills or is cancelled (no time limit here).
-   *
-   * The price is shifted away from the trader's original price by
-   * `offsetPct` in the direction that makes the order MORE aggressive
-   * (crosses further into the book), which is what makes it likely to fill
-   * fast instead of sitting unfilled at the exact price the other trader got:
-   *   BUY  -> price * (1 + offsetPct/100)  (willing to pay a bit more)
-   *   SELL -> price * (1 - offsetPct/100)  (willing to accept a bit less)
+   * GTC (Good-Till-Cancelled) limit order — используется, только если
+   * захочешь вернуть отдельную лимитку на выход. Сейчас в основной
+   * стратегии (fastflip.ts) не вызывается — позиция держится до резолва.
    */
   async placeGtcLimitOrder(params: {
     tokenId: string;
@@ -377,8 +382,6 @@ export class ClobService {
       response: resp,
     });
 
-    // Same response-shape handling as the market order above: a rejection
-    // comes back as a raw error body rather than a thrown exception.
     const respAny = resp as unknown as {
       success?: boolean;
       status?: string | number;
@@ -389,14 +392,6 @@ export class ClobService {
       takingAmount?: string;
     };
 
-    // Same rule as the market order above: `success: true` is the
-    // authoritative signal that the CLOB accepted the order. Unlike the
-    // market FAK order, a GTC order doesn't need to fill immediately to
-    // count as accepted — it can also come back as "live" (resting on the
-    // book, waiting to fill) rather than "matched" (filled right away), and
-    // both are a success here. We don't gate on the exact status string
-    // beyond that since the CLOB's full status vocabulary isn't part of the
-    // SDK's public types — only `success` is documented/stable.
     if (respAny.success !== true) {
       const reason = respAny.error || respAny.errorMsg || `CLOB rejected the order (status: ${respAny.status})`;
       throw new Error(reason);

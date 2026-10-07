@@ -7,14 +7,15 @@
     "build": "tsc -p tsconfig.json",
     "start": "npx tsx src/statsCollector.ts",
     "dev": "tsc -w",
-    "lint": "tsc -p tsconfig.json --noEmit"
+    "lint": "tsc -p tsconfig.json --noEmit",
+    "start:research": "npx tsx src/researchLogger.ts"
   },
   "dependencies": {
     "@polymarket/builder-relayer-client": "^0.0.8",
     "@polymarket/builder-signing-sdk": "^0.0.8",
     "@polymarket/clob-client": "^5.2.1",
     "@polymarket/clob-client-v2": "^1.1.0",
-    "dotenv": "^17.2.3",
+    "dotenv": "^17.4.2",
     "ethers": "^5.8.0",
     "viem": "^2.55.19",
     "ws": "^8.21.3"
@@ -26,6 +27,6 @@
     "typescript": "^5.9.3"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=20"
   }
 }

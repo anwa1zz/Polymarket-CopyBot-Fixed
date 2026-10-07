@@ -1,11 +1,27 @@
 /**
  * Модуль 2: слежение за ценами в реальном времени через CLOB WebSocket.
  * Подписывается на список токенов, вызывает callback при каждом изменении цены.
+ *
+ * ВАЖНО: у websocket-соединений бывает "тихая смерть" — сеть/прокси между
+ * нами и биржей может оборвать сокет без штатного события "close" (например
+ * NAT/прокси-таймаут на простое). Формально сокет выглядит открытым, но
+ * сообщения больше не приходят.
+ *
+ * КРИТИЧЕСКИ ВАЖНО: watchdog отслеживает ТОЛЬКО реальные рыночные
+ * сообщения (message), а НЕ pong-ответы на наш ping. Раньше pong тоже
+ * обновлял метку "последней активности", из-за чего watchdog никогда не
+ * замечал зависание: сокет технически отвечал на пинги (TCP-сессия
+ * жива), но реальные обновления цены не приходили 20+ минут — это
+ * маскировалось как "всё в порядке". pong доказывает только, что сокет
+ * жив, а не то, что данные реально идут.
  */
 
 import WebSocket from "ws";
 
 const WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
+const STALE_TIMEOUT_MS = 45 * 1000; // если так долго нет РЕАЛЬНЫХ рыночных сообщений — считаем зависшим
+const WATCHDOG_CHECK_MS = 10 * 1000;
+const PING_INTERVAL_MS = 20 * 1000;
 
 export interface PriceUpdate {
   tokenId: string;
@@ -19,6 +35,11 @@ export class PriceWatcher {
   private tokenIds: string[];
   private onUpdate: (update: PriceUpdate) => void;
   private stopped = false;
+  // Только реальные рыночные сообщения (message) обновляют эту метку.
+  // pong НЕ обновляет — см. комментарий в начале файла.
+  private lastDataMessageAt = Date.now();
+  private watchdogTimer: NodeJS.Timeout | null = null;
+  private pingTimer: NodeJS.Timeout | null = null;
 
   constructor(tokenIds: string[], onUpdate: (update: PriceUpdate) => void) {
     this.tokenIds = tokenIds;
@@ -27,31 +48,88 @@ export class PriceWatcher {
 
   start(): void {
     this.connect(1000);
+    this.startWatchdog();
   }
 
   private connect(backoffMs: number): void {
     if (this.stopped) return;
 
+    this.lastDataMessageAt = Date.now(); // не считаем зависшим сразу после (пере)подключения
     this.ws = new WebSocket(WS_URL);
 
     this.ws.on("open", () => {
       console.log(`[priceWatcher] подключено, подписка на ${this.tokenIds.length} токенов`);
+      this.lastDataMessageAt = Date.now();
       this.ws!.send(JSON.stringify({ type: "market", assets_ids: this.tokenIds }));
+      this.startPing();
     });
 
     this.ws.on("message", (raw: Buffer) => {
+      this.lastDataMessageAt = Date.now();
       this.handleMessage(raw.toString());
+    });
+
+    // ВАЖНО: pong НЕ обновляет lastDataMessageAt. Смотри комментарий в
+    // начале файла — иначе watchdog никогда не заметит зависание.
+    this.ws.on("pong", () => {
+      // намеренно ничего не делаем
     });
 
     this.ws.on("close", () => {
       if (this.stopped) return;
       console.log(`[priceWatcher] соединение закрыто, переподключение через ${backoffMs}мс`);
+      this.stopPing();
       setTimeout(() => this.connect(Math.min(backoffMs * 2, 30000)), backoffMs);
     });
 
     this.ws.on("error", (err) => {
       console.error("[priceWatcher] ошибка:", err.message);
     });
+  }
+
+  /** Периодически шлём ping — многие прокси/NAT держат соединение живым только пока идёт трафик. */
+  private startPing(): void {
+    this.stopPing();
+    this.pingTimer = setInterval(() => {
+      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+        try {
+          this.ws.ping();
+        } catch {
+          // проигнорируем — watchdog всё равно поймает мёртвый сокет по таймауту
+        }
+      }
+    }, PING_INTERVAL_MS);
+  }
+
+  private stopPing(): void {
+    if (this.pingTimer) {
+      clearInterval(this.pingTimer);
+      this.pingTimer = null;
+    }
+  }
+
+  /** Следит за тем, что РЕАЛЬНЫЕ рыночные сообщения приходят. Если тишина слишком долго — считаем сокет мёртвым/зависшим и форсируем переподключение. */
+  private startWatchdog(): void {
+    this.watchdogTimer = setInterval(() => {
+      if (this.stopped) return;
+      const idleMs = Date.now() - this.lastDataMessageAt;
+      if (idleMs > STALE_TIMEOUT_MS) {
+        console.log(`[priceWatcher] ⚠️ Нет рыночных сообщений ${Math.round(idleMs / 1000)}с — форсируем переподключение.`);
+        this.forceReconnect();
+      }
+    }, WATCHDOG_CHECK_MS);
+  }
+
+  private forceReconnect(): void {
+    this.lastDataMessageAt = Date.now(); // сброс, чтобы не спамить форс-реконнектом пока идёт переподключение
+    this.stopPing();
+    try {
+      this.ws?.removeAllListeners();
+      this.ws?.terminate(); // terminate, а не close — не ждём штатного handshake от уже мёртвого сокета
+    } catch (err) {
+      console.error("[priceWatcher] ошибка при terminate:", (err as Error).message);
+    }
+    this.connect(1000);
   }
 
   private handleMessage(raw: string): void {
@@ -80,6 +158,11 @@ export class PriceWatcher {
 
   stop(): void {
     this.stopped = true;
+    this.stopPing();
+    if (this.watchdogTimer) {
+      clearInterval(this.watchdogTimer);
+      this.watchdogTimer = null;
+    }
     this.ws?.close();
   }
 }
